@@ -1,21 +1,25 @@
 package com.dustforge.flowhook
 
+import android.app.Dialog
 import android.content.ComponentName
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.Window
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import rikka.shizuku.Shizuku
 
 class MainActivity : AppCompatActivity() {
 
@@ -23,8 +27,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var server: EditText
     private lateinit var token: EditText
     private lateinit var footer: TextView
-
-    private val shizukuListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refreshStatus() }
+    private lateinit var toggleServices: SwitchCompat
+    private lateinit var toggleAdb: SwitchCompat
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,35 +38,44 @@ class MainActivity : AppCompatActivity() {
         server = findViewById(R.id.server)
         token  = findViewById(R.id.token)
         footer = findViewById(R.id.footer)
+        toggleServices = findViewById(R.id.toggle_services)
+        toggleAdb = findViewById(R.id.toggle_adb)
 
         server.setText(Config.getServerUrl(this))
         token.setText(Config.getToken(this) ?: "")
 
-        findViewById<Button>(R.id.btn_save).setOnClickListener {
-            Config.setServerUrl(this, server.text.toString().trim())
-            Config.setToken(this, token.text.toString().trim())
-            stopService(Intent(this, FlowhookService::class.java))
-            startForegroundService(Intent(this, FlowhookService::class.java))
-            toast("Service restarted")
+        // Left toggle: Flowhook services on/off
+        toggleServices.isChecked = Config.getServicesEnabled(this)
+        toggleServices.setOnCheckedChangeListener { _, isChecked ->
+            Config.setServicesEnabled(this, isChecked)
+            syncService()
             refreshStatus()
         }
 
-        findViewById<Button>(R.id.btn_adb).setOnClickListener {
-            toast("Connecting to localhost ADB… if prompted, tap Allow on the phone.")
-            CoroutineScope(Dispatchers.IO).launch {
-                val r = AdbExecutor.connect(this@MainActivity)
-                withContext(Dispatchers.Main) {
-                    if (r.exit == 0) {
-                        toast("ADB bridge connected ✓")
-                        // Try to pre-grant privileged perms now
-                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.WRITE_SECURE_SETTINGS")
-                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
-                    } else {
-                        toast("ADB bridge: ${r.stderr.take(80)}")
-                    }
-                    refreshStatus()
-                }
+        // Right toggle: ADB bridge on/off — tapping OFF requires confirmation
+        toggleAdb.isChecked = Config.getAdbBridgeEnabled(this)
+        toggleAdb.setOnClickListener {
+            val newState = toggleAdb.isChecked  // Switch already flipped visually
+            if (newState) {
+                // Turning on (from UI) — but note this doesn't actually enable tcpip.
+                // It just tells Flowhook to try using it. Show a note.
+                Config.setAdbBridgeEnabled(this, true)
+                toast("ADB Bridge will re-try connection. If tcpip is off, connect via USB and run `adb tcpip 5555`.")
+                syncService()
+                refreshStatus()
+            } else {
+                // Turning off — show confirmation. Revert toggle until confirmed.
+                toggleAdb.isChecked = true
+                showAdbOffConfirmDialog()
             }
+        }
+
+        findViewById<Button>(R.id.btn_save).setOnClickListener {
+            Config.setServerUrl(this, server.text.toString().trim())
+            Config.setToken(this, token.text.toString().trim())
+            syncService()
+            toast("Saved")
+            refreshStatus()
         }
 
         findViewById<Button>(R.id.btn_test).setOnClickListener {
@@ -74,47 +87,89 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        findViewById<Button>(R.id.btn_battery_opt).setOnClickListener {
-            openBatteryOptimization()
-        }
-        findViewById<Button>(R.id.btn_samsung).setOnClickListener {
-            openSamsungNeverSleeping()
-        }
-        findViewById<Button>(R.id.btn_app_info).setOnClickListener {
-            openAppInfo()
-        }
+        findViewById<Button>(R.id.btn_battery_opt).setOnClickListener { openBatteryOptimization() }
+        findViewById<Button>(R.id.btn_samsung).setOnClickListener { openSamsungNeverSleeping() }
+        findViewById<Button>(R.id.btn_app_info).setOnClickListener { openAppInfo() }
 
-        Shizuku.addRequestPermissionResultListener(shizukuListener)
-
-        // Start service on first open if token present
-        if (!Config.getToken(this).isNullOrBlank()) {
-            startForegroundService(Intent(this, FlowhookService::class.java))
-        }
+        // Kick the service to the right state for current toggles
+        syncService()
 
         refreshStatus()
         footer.text = "v${packageManager.getPackageInfo(packageName, 0).versionName}"
     }
 
-    override fun onDestroy() {
-        Shizuku.removeRequestPermissionResultListener(shizukuListener)
-        super.onDestroy()
+    override fun onResume() { super.onResume(); refreshStatus() }
+
+    private fun syncService() {
+        val left = Config.getServicesEnabled(this)
+        val right = Config.getAdbBridgeEnabled(this)
+        val mode = when {
+            left -> FlowhookService.Mode.FULL
+            right -> FlowhookService.Mode.IDLE
+            else -> FlowhookService.Mode.STOP
+        }
+        if (mode == FlowhookService.Mode.STOP) {
+            stopService(Intent(this, FlowhookService::class.java))
+        } else {
+            startForegroundService(FlowhookService.intentFor(this, mode))
+        }
     }
 
-    override fun onResume() { super.onResume(); refreshStatus() }
+    private fun showAdbOffConfirmDialog() {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.setContentView(R.layout.dialog_adb_confirm)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout(
+            (resources.displayMetrics.widthPixels * 0.88).toInt(),
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dialog.setCancelable(true)
+
+        dialog.findViewById<Button>(R.id.btn_cancel).setOnClickListener {
+            dialog.dismiss()
+            // toggle stays on (already reverted before showing dialog)
+        }
+        dialog.findViewById<Button>(R.id.btn_confirm).setOnClickListener {
+            dialog.dismiss()
+            toggleAdb.isChecked = false
+            Config.setAdbBridgeEnabled(this, false)
+            toast("Disabling ADB Bridge…")
+            CoroutineScope(Dispatchers.IO).launch {
+                // Issue the kill command via the current ADB bridge. This will itself
+                // disconnect us, which is expected.
+                val killCmd = "setprop service.adb.tcp.port -1; stop adbd; start adbd"
+                val r = AdbExecutor.exec(killCmd, timeoutMs = 5_000)
+                AdbExecutor.disconnect()
+                withContext(Dispatchers.Main) {
+                    toast("ADB Bridge off. Re-enable via USB + `adb tcpip 5555`.")
+                    syncService()
+                    refreshStatus()
+                }
+            }
+        }
+        dialog.show()
+    }
 
     private fun refreshStatus() {
         val adb = AdbExecutor.isReady()
-        val shizuku = ShizukuExecutor.isReady()
-        val perm = ShizukuExecutor.hasPermission()
+        val leftOn = Config.getServicesEnabled(this)
+        val rightOn = Config.getAdbBridgeEnabled(this)
         val tokenSet = !Config.getToken(this).isNullOrBlank()
         val batteryIgnored = isIgnoringBatteryOpt()
         val hasWss = checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val mode = when {
+            leftOn -> "FULL"
+            rightOn -> "IDLE (ADB only)"
+            else -> "OFF"
+        }
         val sb = StringBuilder()
-        sb.appendLine(line("ADB bridge (self)", adb))
-        sb.appendLine(line("Shizuku running (fallback)", shizuku))
-        sb.appendLine(line("Shizuku permission", perm))
-        sb.appendLine(line("WRITE_SECURE_SETTINGS", hasWss))
+        sb.appendLine("Mode: $mode")
+        sb.appendLine(line("Flowhook services (left toggle)", leftOn))
+        sb.appendLine(line("ADB Bridge (right toggle)", rightOn))
+        sb.appendLine(line("ADB connected", adb))
         sb.appendLine(line("Token configured", tokenSet))
+        sb.appendLine(line("WRITE_SECURE_SETTINGS", hasWss))
         sb.appendLine(line("Battery optimization exempt", batteryIgnored))
         sb.append("Server: ${Config.getServerUrl(this)}")
         status.text = sb.toString()
@@ -141,7 +196,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun openSamsungNeverSleeping() {
-        // Try Samsung's Device Care battery page. Class names vary by OneUI version.
         val attempts = listOf(
             "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity",
             "com.samsung.android.sm" to "com.samsung.android.sm.ui.battery.BatteryActivity",
@@ -157,12 +211,11 @@ class MainActivity : AppCompatActivity() {
                 startActivity(i)
                 toast("Find 'Never sleeping apps' → add Flowhook")
                 return
-            } catch (_: Throwable) { /* try next */ }
+            } catch (_: Throwable) { }
         }
-        // Fallback: generic battery settings
         try {
             startActivity(Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS))
-            toast("Navigate to 'Apps' or 'Background usage limits' → Never sleeping apps")
+            toast("Navigate to 'Background usage limits' → Never sleeping apps")
         } catch (_: Throwable) {
             toast("Couldn't open Samsung battery settings")
         }

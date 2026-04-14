@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="@color/fh_card"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Turn off ADB Bridge?"
+        android:textColor="@color/fh_fg"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="12dp"/>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="If you turn this off, you won't be able to turn it back on until you connect your phone to a computer and run &#160;&#160;adb tcpip 5555."
+        android:textColor="@color/fh_fg"
+        android:textSize="14sp"
+        android:lineSpacingExtra="3dp"
+        android:layout_marginBottom="20dp"/>
+
+    <android.widget.Button
+        android:id="@+id/btn_cancel"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:text="Leave ADB Bridge on"
+        android:textColor="#0B0D10"
+        android:textAllCaps="false"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:background="@drawable/bg_button_primary"
+        android:stateListAnimator="@null"
+        android:layout_marginBottom="10dp"/>
+
+    <android.widget.Button
+        android:id="@+id/btn_confirm"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:text="Turn ADB Bridge off"
+        android:textColor="#FFFFFF"
+        android:textAllCaps="false"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:background="@drawable/bg_button_danger"
+        android:stateListAnimator="@null"/>
+</LinearLayout>
