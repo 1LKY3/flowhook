@@ -11,6 +11,10 @@ import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
 
 class MainActivity : AppCompatActivity() {
@@ -43,17 +47,31 @@ class MainActivity : AppCompatActivity() {
             refreshStatus()
         }
 
-        findViewById<Button>(R.id.btn_shizuku).setOnClickListener {
-            if (ShizukuExecutor.isReady()) {
-                try { Shizuku.requestPermission(42) } catch (_: Throwable) {}
-            } else {
-                toast("Shizuku not running — start it first.")
+        findViewById<Button>(R.id.btn_adb).setOnClickListener {
+            toast("Connecting to localhost ADB… if prompted, tap Allow on the phone.")
+            CoroutineScope(Dispatchers.IO).launch {
+                val r = AdbExecutor.connect(this@MainActivity)
+                withContext(Dispatchers.Main) {
+                    if (r.exit == 0) {
+                        toast("ADB bridge connected ✓")
+                        // Try to pre-grant privileged perms now
+                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.WRITE_SECURE_SETTINGS")
+                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
+                    } else {
+                        toast("ADB bridge: ${r.stderr.take(80)}")
+                    }
+                    refreshStatus()
+                }
             }
         }
 
         findViewById<Button>(R.id.btn_test).setOnClickListener {
-            val r = ShizukuExecutor.exec("id; getprop ro.product.model")
-            status.text = "exit=${r.exit}\n${r.stdout}${r.stderr}"
+            CoroutineScope(Dispatchers.IO).launch {
+                val r = Executor.exec("id; getprop ro.product.model")
+                withContext(Dispatchers.Main) {
+                    status.text = "[${r.source}] exit=${r.exit}\n${r.stdout}${r.stderr}"
+                }
+            }
         }
 
         findViewById<Button>(R.id.btn_battery_opt).setOnClickListener {
@@ -85,13 +103,17 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() { super.onResume(); refreshStatus() }
 
     private fun refreshStatus() {
+        val adb = AdbExecutor.isReady()
         val shizuku = ShizukuExecutor.isReady()
         val perm = ShizukuExecutor.hasPermission()
         val tokenSet = !Config.getToken(this).isNullOrBlank()
         val batteryIgnored = isIgnoringBatteryOpt()
+        val hasWss = checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) == android.content.pm.PackageManager.PERMISSION_GRANTED
         val sb = StringBuilder()
-        sb.appendLine(line("Shizuku running", shizuku))
+        sb.appendLine(line("ADB bridge (self)", adb))
+        sb.appendLine(line("Shizuku running (fallback)", shizuku))
         sb.appendLine(line("Shizuku permission", perm))
+        sb.appendLine(line("WRITE_SECURE_SETTINGS", hasWss))
         sb.appendLine(line("Token configured", tokenSet))
         sb.appendLine(line("Battery optimization exempt", batteryIgnored))
         sb.append("Server: ${Config.getServerUrl(this)}")

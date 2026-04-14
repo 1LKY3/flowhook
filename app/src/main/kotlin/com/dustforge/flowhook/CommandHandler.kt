@@ -20,21 +20,22 @@ object CommandHandler {
             when (type) {
                 "exec" -> {
                     val cmd = msg.optString("cmd")
-                    val r = ShizukuExecutor.exec(cmd)
+                    val r = Executor.exec(cmd)
                     res.put("ok", r.exit == 0)
                         .put("stdout", r.stdout)
                         .put("stderr", r.stderr)
                         .put("exit", r.exit)
+                        .put("source", r.source)
                 }
                 "install" -> handleInstall(msg.optString("apk_url"), res)
                 "uninstall" -> {
                     val pkg = msg.optString("package")
-                    val r = ShizukuExecutor.exec("pm uninstall $pkg")
+                    val r = Executor.exec("pm uninstall $pkg")
                     res.put("ok", r.exit == 0).put("stdout", r.stdout).put("stderr", r.stderr).put("exit", r.exit)
                 }
                 "screencap" -> {
                     val tmp = "/sdcard/flowhook_cap.png"
-                    val r = ShizukuExecutor.exec("screencap -p $tmp && base64 $tmp && rm $tmp", 20_000)
+                    val r = Executor.exec("screencap -p $tmp && base64 $tmp && rm $tmp", 20_000)
                     res.put("ok", r.exit == 0).put("png_b64", r.stdout.replace("\n", "")).put("stderr", r.stderr)
                 }
                 else -> res.put("ok", false).put("error", "unknown command type: $type")
@@ -56,11 +57,11 @@ object CommandHandler {
             }
             // Copy to /data/local/tmp via Shizuku to guarantee pm can read it under all SELinux profiles
             val stagePath = "/data/local/tmp/flowhook_install.apk"
-            val copyRes = ShizukuExecutor.exec("cp ${tmp.absolutePath} $stagePath && chmod 644 $stagePath", 30_000)
+            val copyRes = Executor.exec("cp ${tmp.absolutePath} $stagePath && chmod 644 $stagePath", 30_000)
             if (copyRes.exit != 0) {
                 return res.put("ok", false).put("error", "stage failed: ${copyRes.stderr}")
             }
-            val r = ShizukuExecutor.exec("pm install -r -t $stagePath; rm -f $stagePath", 120_000)
+            val r = Executor.exec("pm install -r -t $stagePath; rm -f $stagePath", 120_000)
             res.put("ok", r.exit == 0 && r.stdout.contains("Success", true))
                 .put("stdout", r.stdout).put("stderr", r.stderr).put("exit", r.exit)
         } catch (e: Throwable) {

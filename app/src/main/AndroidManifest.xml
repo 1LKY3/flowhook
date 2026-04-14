@@ -11,7 +11,14 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- Shizuku -->
+    <!-- Privileged permissions: granted via `pm grant` through our own ADB bridge on first connect.
+         These allow Flowhook to re-enable wireless debugging after reboot and read system logs. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.READ_LOGS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Shizuku (kept as fallback; v0.2+ prefers self-managed ADB bridge) -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <queries>

@@ -37,6 +37,30 @@ class FlowhookService : Service() {
         acquireWakeLock()
         startForeground()
         connect()
+        startAdbSupervisor()
+    }
+
+    /**
+     * Keeps the self-managed ADB bridge alive. If AdbExecutor isn't connected,
+     * attempt to (re)connect every 10s. No-op if already up.
+     */
+    private fun startAdbSupervisor() {
+        scope.launch {
+            while (isActive) {
+                if (!AdbExecutor.isReady()) {
+                    val r = AdbExecutor.connect(applicationContext)
+                    if (r.exit == 0) {
+                        Log.i(TAG, "adb bridge connected: ${r.stdout.trim()}")
+                        // Best-effort: grant ourselves WRITE_SECURE_SETTINGS so boot-time recovery is possible.
+                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.WRITE_SECURE_SETTINGS")
+                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
+                    } else {
+                        Log.w(TAG, "adb bridge connect failed: ${r.stderr}")
+                    }
+                }
+                delay(10_000)
+            }
+        }
     }
 
     private fun acquireWakeLock() {

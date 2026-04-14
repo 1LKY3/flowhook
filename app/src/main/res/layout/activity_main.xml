@@ -162,12 +162,12 @@
             android:layout_marginBottom="20dp">
 
             <android.widget.Button
-                android:id="@+id/btn_shizuku"
+                android:id="@+id/btn_adb"
                 android:layout_width="0dp"
                 android:layout_height="48dp"
                 android:layout_weight="1"
                 android:layout_marginEnd="6dp"
-                android:text="Request Shizuku"
+                android:text="Connect ADB"
                 android:textColor="@color/fh_fg"
                 android:textAllCaps="false"
                 android:textSize="13sp"

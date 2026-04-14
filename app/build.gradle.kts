@@ -11,8 +11,8 @@ android {
         applicationId = "com.dustforge.flowhook"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -29,6 +29,17 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*"
+            )
+        }
+    }
 }
 
 dependencies {
@@ -41,7 +52,12 @@ dependencies {
     // OkHttp for WebSocket + HTTP
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Shizuku API
+    // Shizuku API (kept as optional fallback; v0.2 prefers self-managed ADB bridge)
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+
+    // Self-managed ADB bridge (no Shizuku dependency once paired)
+    implementation("dev.mobile:dadb:1.2.8")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 }
