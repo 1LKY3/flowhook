@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Flowhook" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="android:windowBackground">@color/fh_bg</item>
+        <item name="android:statusBarColor">@color/fh_bg</item>
+        <item name="android:navigationBarColor">@color/fh_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:textColor">@color/fh_fg</item>
+        <item name="colorPrimary">@color/fh_accent</item>
+        <item name="colorOnPrimary">#0B0D10</item>
+        <item name="colorAccent">@color/fh_accent</item>
+        <item name="colorControlActivated">@color/fh_accent</item>
+        <item name="colorControlHighlight">@color/fh_button_ripple</item>
+    </style>
+</resources>

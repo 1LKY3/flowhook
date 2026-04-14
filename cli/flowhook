@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""
+flowhook CLI — talk to flowhook.dustforge.com from the command line.
+
+  flowhook exec '<shell>'           run shell on the phone, print stdout
+  flowhook sh <interactive>         read cmds from stdin one per line
+  flowhook install <apk_url>        pm install -r via Shizuku
+  flowhook uninstall <pkg>
+  flowhook devices                  list enrolled devices
+  flowhook audit [N]                show last N audit rows (default 20)
+  flowhook screencap <out.png>      save screenshot
+  flowhook health
+
+Token is read from ~/.flowhook/user_token.
+"""
+import base64
+import json
+import sys
+import urllib.request
+from pathlib import Path
+
+BASE = "https://flowhook.dustforge.com"
+TOKEN_FILE = Path.home() / ".flowhook" / "user_token"
+
+def token() -> str:
+    if not TOKEN_FILE.exists():
+        sys.exit(f"no token at {TOKEN_FILE}")
+    return TOKEN_FILE.read_text().strip()
+
+def req(method: str, path: str, body: dict | None = None, timeout: float = 60):
+    url = BASE + path
+    data = json.dumps(body).encode() if body else None
+    headers = {"Authorization": f"Bearer {token()}"}
+    if body:
+        headers["Content-Type"] = "application/json"
+    r = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code}: {e.read().decode(errors='replace')}")
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print(__doc__); sys.exit(0)
+    cmd = argv[0]
+    rest = argv[1:]
+
+    if cmd == "health":
+        print(json.dumps(req("GET", "/health"), indent=2))
+    elif cmd == "devices":
+        print(json.dumps(req("GET", "/devices"), indent=2))
+    elif cmd == "exec":
+        if not rest:
+            sys.exit("usage: flowhook exec '<shell>'")
+        r = req("POST", "/exec", {"cmd": " ".join(rest)}, timeout=90)
+        sys.stdout.write(r.get("stdout", ""))
+        if r.get("stderr"):
+            sys.stderr.write(r["stderr"])
+        sys.exit(r.get("exit") or (0 if r.get("ok") else 1))
+    elif cmd == "sh":
+        # read lines from stdin, exec each
+        for line in sys.stdin:
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            print(f"$ {line}")
+            r = req("POST", "/exec", {"cmd": line}, timeout=90)
+            sys.stdout.write(r.get("stdout", ""))
+            if r.get("stderr"): sys.stderr.write(r["stderr"])
+    elif cmd == "install":
+        if not rest:
+            sys.exit("usage: flowhook install <apk_url>")
+        r = req("POST", "/install", {"apk_url": rest[0]}, timeout=300)
+        print(json.dumps(r, indent=2))
+    elif cmd == "uninstall":
+        if not rest:
+            sys.exit("usage: flowhook uninstall <package>")
+        print(json.dumps(req("POST", "/uninstall", {"package": rest[0]}), indent=2))
+    elif cmd == "screencap":
+        out = Path(rest[0] if rest else "screen.png")
+        r = req("GET", "/screencap", timeout=60)
+        if not r.get("ok"):
+            sys.exit(f"screencap failed: {r.get('error')}\n{r.get('stderr','')}")
+        out.write_bytes(base64.b64decode(r["png_b64"]))
+        print(f"wrote {out} ({out.stat().st_size} bytes)")
+    elif cmd == "audit":
+        n = int(rest[0]) if rest else 20
+        print(json.dumps(req("GET", f"/audit?limit={n}"), indent=2))
+    elif cmd == "logcat":
+        tag = rest[0] if rest else ""
+        q = f"?tag={tag}" if tag else ""
+        r = req("GET", f"/logcat{q}", timeout=30)
+        sys.stdout.write(r.get("stdout", ""))
+    else:
+        print(__doc__); sys.exit(1)
+
+if __name__ == "__main__":
+    main()

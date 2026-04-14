@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fh_bg">#0B0D10</color>
+    <color name="fh_card">#14181D</color>
+    <color name="fh_border">#242A32</color>
+    <color name="fh_fg">#E6E8EB</color>
+    <color name="fh_muted">#8A9099</color>
+    <color name="fh_accent">#7ED957</color>
+    <color name="fh_accent_dim">#3F6B2B</color>
+    <color name="fh_code_bg">#0F1216</color>
+    <color name="fh_button_ripple">#337ED957</color>
+</resources>

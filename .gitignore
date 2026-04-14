@@ -1,0 +1,40 @@
+# Android
+*.iml
+.gradle/
+build/
+.idea/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.keystore
+*.jks
+
+# Gradle
+.gradletasknamecache
+gradle-app.setting
+gradle-wrapper.jar
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# Server data
+server/db/
+server/*.db
+server/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+.vscode/
