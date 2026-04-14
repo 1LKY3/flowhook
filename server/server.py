@@ -9,11 +9,14 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
+import smtplib
 import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
+from email.mime.text import MIMEText
 from pathlib import Path
 
 import bcrypt
@@ -24,6 +27,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -53,6 +57,13 @@ def db():
 def init_db():
     with db() as c:
         c.executescript("""
+        CREATE TABLE IF NOT EXISTS waitlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            source TEXT,
+            ip TEXT,
+            ts REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -381,6 +392,51 @@ async def screencap(device_id: str | None = None, claims: dict = Depends(require
         raise HTTPException(500, res.get("error", "screencap failed"))
     # res contains base64-encoded PNG
     return res
+
+# ---- Waitlist --------------------------------------------------------
+SMTP_HOST = os.environ.get("FLOWHOOK_SMTP_HOST", "100.83.112.88")
+SMTP_PORT = int(os.environ.get("FLOWHOOK_SMTP_PORT", "25"))
+WAITLIST_FROM = os.environ.get("FLOWHOOK_WAITLIST_FROM", "waitlist@dustforge.com")
+WAITLIST_TO = os.environ.get("FLOWHOOK_WAITLIST_TO", "ky@dustforge.com")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+class WaitlistReq(BaseModel):
+    email: str
+    source: str | None = None
+
+def send_waitlist_email(email: str, source: str | None, ip: str | None):
+    try:
+        body = f"New waitlist signup:\n\n  email:  {email}\n  source: {source or '(none)'}\n  ip:     {ip or '(unknown)'}\n  ts:     {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+        msg = MIMEText(body)
+        msg["Subject"] = f"[flowhook] waitlist: {email}"
+        msg["From"] = WAITLIST_FROM
+        msg["To"] = WAITLIST_TO
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.ehlo()
+            s.send_message(msg)
+        print(f"[flowhook] waitlist email sent for {email}")
+    except Exception as e:
+        print(f"[flowhook] waitlist email FAILED for {email}: {e}")
+
+@app.post("/waitlist")
+async def waitlist(req: WaitlistReq, request: Request):
+    email = req.email.strip().lower()
+    if not EMAIL_RE.match(email) or len(email) > 200:
+        raise HTTPException(400, "invalid email")
+    ip = request.client.host if request.client else None
+    with db() as c:
+        try:
+            c.execute(
+                "INSERT INTO waitlist (email, source, ip, ts) VALUES (?, ?, ?, ?)",
+                (email, (req.source or "")[:200], ip, time.time()),
+            )
+            new = True
+        except sqlite3.IntegrityError:
+            new = False
+    if new:
+        # fire-and-forget email
+        asyncio.get_event_loop().run_in_executor(None, send_waitlist_email, email, req.source, ip)
+    return {"ok": True, "new": new, "message": "You're on the waitlist. We'll email you when a server slot opens."}
 
 @app.get("/health")
 def health():
