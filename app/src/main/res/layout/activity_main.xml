@@ -11,16 +11,15 @@
         android:orientation="vertical"
         android:padding="20dp">
 
-        <!-- Header with toggles: [Flowhook ON/OFF]   [icon]   [ADB bridge ON/OFF] -->
+        <!-- Header: two labeled toggles with instructional subtext -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:paddingBottom="12dp"
+            android:paddingBottom="14dp"
             android:layout_marginBottom="12dp">
 
-            <!-- Left toggle -->
+            <!-- Left block: Flowhook toggle -->
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -31,31 +30,29 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Flowhook"
+                    android:text="FLOWHOOK"
                     android:textColor="@color/fh_fg"
                     android:textSize="12sp"
                     android:textStyle="bold"
-                    android:letterSpacing="0.06"/>
+                    android:letterSpacing="0.08"/>
 
                 <androidx.appcompat.widget.SwitchCompat
                     android:id="@+id/toggle_services"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:thumbTint="@color/switch_thumb"
-                    android:trackTint="@color/switch_track_green"
-                    android:layout_marginTop="4dp"/>
+                    android:layout_marginTop="4dp"
+                    android:layout_marginBottom="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Tap off to save battery.\nADB stays warm."
+                    android:textColor="@color/fh_muted"
+                    android:textSize="11sp"
+                    android:lineSpacingExtra="1dp"/>
             </LinearLayout>
 
-            <!-- Center icon -->
-            <ImageView
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@drawable/ic_launcher_fg"
-                android:background="#0B0D10"
-                android:padding="4dp"
-                android:contentDescription="Flowhook"/>
-
-            <!-- Right toggle -->
+            <!-- Right block: ADB Bridge toggle -->
             <LinearLayout
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
@@ -66,19 +63,27 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="ADB Bridge"
+                    android:text="ADB BRIDGE"
                     android:textColor="@color/fh_fg"
                     android:textSize="12sp"
                     android:textStyle="bold"
-                    android:letterSpacing="0.06"/>
+                    android:letterSpacing="0.08"/>
 
                 <androidx.appcompat.widget.SwitchCompat
                     android:id="@+id/toggle_adb"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:thumbTint="@color/switch_thumb"
-                    android:trackTint="@color/switch_track_red"
-                    android:layout_marginTop="4dp"/>
+                    android:layout_marginTop="4dp"
+                    android:layout_marginBottom="4dp"/>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Tap off to cut remote\naccess. Requires USB to re-enable."
+                    android:textColor="@color/fh_muted"
+                    android:textSize="11sp"
+                    android:gravity="end"
+                    android:lineSpacingExtra="1dp"/>
             </LinearLayout>
         </LinearLayout>
 
@@ -88,13 +93,22 @@
             android:background="@color/fh_border"
             android:layout_marginBottom="16dp"/>
 
-        <!-- Brand row -->
+        <!-- Brand row: logo + title + tagline -->
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
             android:layout_marginBottom="20dp">
+
+            <ImageView
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@drawable/ic_launcher_fg"
+                android:background="#0B0D10"
+                android:padding="2dp"
+                android:contentDescription="Flowhook"
+                android:layout_marginEnd="10dp"/>
 
             <TextView
                 android:layout_width="wrap_content"
@@ -292,7 +306,7 @@
             android:id="@+id/footer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="v0.3.0"
+            android:text="v0.3.1"
             android:textColor="@color/fh_muted"
             android:textSize="11sp"
             android:fontFamily="monospace"

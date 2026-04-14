@@ -3,6 +3,7 @@ package com.dustforge.flowhook
 import android.app.Dialog
 import android.content.ComponentName
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
@@ -16,6 +17,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
+import androidx.core.widget.CompoundButtonCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,6 +45,10 @@ class MainActivity : AppCompatActivity() {
 
         server.setText(Config.getServerUrl(this))
         token.setText(Config.getToken(this) ?: "")
+
+        // Apply distinct colors to each toggle: left = green track, right = red track
+        applySwitchColors(toggleServices, checkedTrackColor = 0xFF7ED957.toInt())
+        applySwitchColors(toggleAdb, checkedTrackColor = 0xFFC0392B.toInt())
 
         // Left toggle: Flowhook services on/off
         toggleServices.isChecked = Config.getServicesEnabled(this)
@@ -232,4 +238,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    private fun applySwitchColors(sw: SwitchCompat, checkedTrackColor: Int) {
+        val states = arrayOf(
+            intArrayOf(android.R.attr.state_checked),
+            intArrayOf(-android.R.attr.state_checked)
+        )
+        // Track: colored when on, gray when off
+        sw.trackTintList = ColorStateList(states, intArrayOf(checkedTrackColor, 0xFF3A3F46.toInt()))
+        // Thumb: light when on, muted when off
+        sw.thumbTintList = ColorStateList(states, intArrayOf(0xFFE6E8EB.toInt(), 0xFFB0B4BA.toInt()))
+    }
 }
