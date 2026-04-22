@@ -18,8 +18,12 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
 import androidx.core.widget.CompoundButtonCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -102,6 +106,29 @@ class MainActivity : AppCompatActivity() {
 
         refreshStatus()
         footer.text = "v${packageManager.getPackageInfo(packageName, 0).versionName}"
+
+        // v0.3.2: live-bind to FlowhookService's authoritative WS state
+        // so the ✓/✗ line for "WebSocket connected" flips the instant
+        // the socket opens, closes, or fails — no manual refresh.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                FlowhookService.wsConnected.collect { v ->
+                    android.util.Log.i("FlowhookUI", "DIAG MainActivity saw wsConnected=$v — calling refreshStatus")
+                    refreshStatus()
+                }
+            }
+        }
+        // v0.3.4: do the same for ADB bridge state — the ✓ line should
+        // reflect whether dadb is actually talking to adbd, not whether
+        // the "ADB bridge" toggle is on.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                AdbExecutor.ready.collect { v ->
+                    android.util.Log.i("FlowhookUI", "DIAG MainActivity saw adbReady=$v — calling refreshStatus")
+                    refreshStatus()
+                }
+            }
+        }
     }
 
     override fun onResume() { super.onResume(); refreshStatus() }
@@ -164,6 +191,10 @@ class MainActivity : AppCompatActivity() {
         val tokenSet = !Config.getToken(this).isNullOrBlank()
         val batteryIgnored = isIgnoringBatteryOpt()
         val hasWss = checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        // v0.3.2: reflect real WS state. Only relevant in FULL mode — in
+        // IDLE/OFF the socket is intentionally closed, so we don't show
+        // a stale "✗" scare for a feature the user turned off.
+        val wsUp = FlowhookService.wsConnected.value
         val mode = when {
             leftOn -> "FULL"
             rightOn -> "IDLE (ADB only)"
@@ -172,6 +203,7 @@ class MainActivity : AppCompatActivity() {
         val sb = StringBuilder()
         sb.appendLine("Mode: $mode")
         sb.appendLine(line("Flowhook services (left toggle)", leftOn))
+        if (leftOn) sb.appendLine(line("WebSocket connected", wsUp))
         sb.appendLine(line("ADB Bridge (right toggle)", rightOn))
         sb.appendLine(line("ADB connected", adb))
         sb.appendLine(line("Token configured", tokenSet))

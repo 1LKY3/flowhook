@@ -1041,3 +1041,520 @@ tradeoffs affecting it.
 *This document was written during the session that produced v0.3.1. Future agents: append to
 this log, don't rewrite it. The historical record is the point — you need to see what was
 tried, what was dropped, and why, not just what currently exists.*
+
+---
+
+# Session 2 — v0.3.2: the "green but offline" bug
+
+### 2026-04-22
+
+After v0.3.1 shipped, Kyle used Flowhook as his primary phone-control path for a week. It
+worked — mostly. But over two consecutive days (April 21 and April 22) the same symptom
+recurred: the Flowhook app on his S22 Ultra showed every status line ✓ green, the notification
+said "Remote admin bridge active," yet `flowhook exec` from the workstation returned
+`HTTP 503: no device online for this user`. Force-stop the app, reopen, and it'd work again —
+for hours or a day, until it silently desynced a second time. This session fixed the root
+cause *and* the UX lie that hid it.
+
+## 17. Two bugs, braided together
+
+The visible symptom was one problem. Diagnosing it revealed two:
+
+**Bug A — the UI lied.** `MainActivity.refreshStatus()` built its status lines from five
+booleans: services toggle on, ADB bridge toggle on, ADB locally connected, token saved,
+battery optimization exempt. *None of them* reflected whether the WebSocket to
+`flowhook.dustforge.com` was actually connected and authenticated. The green checkmark for
+"Flowhook services" meant only that the left toggle was on. The live connection state had no
+surface at all — not in the app, not in the notification. Kyle had no way to know the bridge
+was broken except to try a command from his laptop and see it fail. That's the UX lie.
+
+**Bug B — the WebSocket sometimes died silently.** The 0.3.x client/server relied on a
+single keepalive: OkHttp's protocol-level PING frame at 15s, set via
+`OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS)`. That works 95% of the time. The
+5% that bit Kyle:
+
+- **Android Doze.** The phone enters light doze after ~30s stationary with the screen off.
+  Doze allows some background work but throttles network — OkHttp's ping timer gets deferred,
+  and if the carrier NAT's idle-timeout is shorter than the deferred interval, the TCP
+  connection is quietly torn down without a RST reaching either endpoint. Both sides think
+  the socket is still open.
+- **LTE↔5G handoff.** Samsung's modem-switches carriers happen across cell tower transitions
+  and on-demand when signal changes. Public IPs for the phone change. Some middleboxes send
+  RSTs to clean up the old flow; some don't. When they don't, the socket goes into a
+  half-open limbo where reads never return and writes queue forever.
+- **TLS middle-box timeouts.** Cloudflare Tunnel and nginx idle-timeouts exist. Our nginx
+  default is 60s `proxy_read_timeout` — we overrode it for `/agent` to be longer, but on the
+  cell carrier's side the idle window is often 5 minutes or less.
+
+When any of these silently killed the TCP, OkHttp's ping frame went into the black hole with
+it. `onFailure` is only called when a write fails *synchronously* or when the read pipe
+returns EOF/RST. Neither happens in the half-open case. So OkHttp sat there, convinced the
+socket was fine, forever. The server sat at `await ws.receive_text()`, also convinced,
+forever. `AGENTS[device_id]` still pointed at a ghost. `/exec` returned 503.
+
+Force-stop worked because it killed the process, which killed the TCP, which caused the
+server's `receive_text` to finally get a clean disconnect and clean up `AGENTS`. Then the
+service restarted fresh and reconnected. That's also why Kyle's fix felt magical: nothing
+surgical was happening, the app was just being allowed to die and be reborn.
+
+## 18. The four-part fix
+
+We decided to fix both bugs at once, and to fix the UX lie independently of the connection
+bug so the symptom is never hidden again. Four changes land together in v0.3.2:
+
+### 18.1 UI truthfulness — `StateFlow<Boolean>` for WS auth state
+
+`FlowhookService` now owns a `MutableStateFlow<Boolean>` called `_wsConnected`. It flips
+`true` on the `"hello"` handshake response (not on `onOpen`, which only means the TLS socket
+upgraded — the token auth can still fail after that), and `false` on `onClosed`, `onFailure`,
+or when `closeWebSocket()` is called due to mode change. The companion exposes this as
+`wsConnected: StateFlow<Boolean>` so `MainActivity` can bind to it.
+
+`MainActivity` adds one line to `refreshStatus()`:
+
+```
+if (leftOn) sb.appendLine(line("WebSocket connected", wsUp))
+```
+
+and uses `lifecycleScope.launch { repeatOnLifecycle(STARTED) { wsConnected.collect { refreshStatus() } } }`
+so the ✓/✗ flips live the instant the socket state changes — no refresh button, no reopen.
+The `if (leftOn)` gate hides the row in IDLE/OFF mode so we don't show a stale ✗ for a
+feature the user intentionally turned off.
+
+This alone solves the main user-facing problem: the green checkmark finally means what the
+user thinks it means.
+
+### 18.2 App-level heartbeat with a hard deadline
+
+The OkHttp ping isn't reliable enough. Rather than replace it, we layer a second keepalive
+on top: every 20s the client sends `{"type":"ping"}` at the JSON application layer. The
+server already responds with `{"type":"pong"}` (that code existed unchanged). A coroutine
+tracks `lastPongAt`; if more than 30s has passed since the last pong when we go to send the
+next ping, we call `webSocket.cancel()` — not `.close()`. Cancel skips the graceful close
+handshake, which can itself hang on a dead TCP, and fires `onFailure` immediately. The
+existing reconnect loop takes over.
+
+Two constants:
+
+```kotlin
+const val HEARTBEAT_INTERVAL_MS = 20_000L
+const val HEARTBEAT_DEADLINE_MS = 30_000L
+```
+
+The interval is chosen below Android Doze's initial quiet period (~60s stationary before
+first deferred-job window), so a dozing phone still catches a dead socket and reconnects
+before the Doze scheduler reshapes its budget. The deadline (30s) is 1.5× the interval so a
+single dropped ping doesn't trip the watchdog.
+
+We also watch `sock.send(...)`'s return value. OkHttp returns `false` if the send queue is
+saturated — another signal the socket is wedged. Same response: cancel + reconnect.
+
+### 18.3 Server-side receive timeout — kill ghost devices
+
+Even with the client heartbeat, the server can't depend on the client to always be healthy.
+We wrap `ws.receive_text()` in `asyncio.wait_for(..., timeout=90)`:
+
+```python
+try:
+    msg = await asyncio.wait_for(ws.receive_text(), timeout=WS_IDLE_TIMEOUT)
+except asyncio.TimeoutError:
+    print(f"[flowhook] idle-timeout: device={device_id} — closing")
+    await ws.close(code=1001, reason="idle timeout")
+    break
+```
+
+90s is a hair more than three client ping intervals. A healthy client writes every 20s. A
+silent 90s gap means the client is gone. Close the socket, hit the `finally` block,
+`unregister_agent(device_id)` — `AGENTS` no longer points at a ghost. `/exec` either gets a
+fresh agent or returns a *truthful* 503.
+
+### 18.4 Notification text reflects state
+
+The foreground service notification used to say, unconditionally, "Remote admin bridge
+active." Now it reads `"Remote admin bridge: connected"` when the WS flow is `true` and
+`"Remote admin bridge: reconnecting…"` when it's `false`. A new `updateNotification()`
+helper reissues `nm.notify(NOTIF_ID, …)` every time state flips — no app-open required. Drag
+the shade, see the truth.
+
+## 19. Why the bug took two days to surface
+
+Three reasons this hid itself so well:
+
+1. **OkHttp's ping *looked* sufficient.** It is, for most paths. The silent-blackhole case
+   is rare enough to not show up in the first week of daily use. Enough people have shipped
+   WebSocket apps over cell networks without layering their own heartbeat that it felt like
+   overbuilding.
+2. **The UI's false green validated the user's first assumption.** When Kyle saw "app says
+   connected, CLI says offline," his first debug move was to force-stop the app — which
+   worked. That loop (symptom → app restart → back to working) never forced him to ask *why*
+   it disconnected in the first place. The fix for symptom (A) was so cheap the root cause
+   (B) didn't present.
+3. **Server logs never complained.** `await ws.receive_text()` with no timeout produced zero
+   log output for a wedged socket. There was nothing in `journalctl -u flowhook` saying
+   "device 6ff67dbec1d9ef41 has been silent for 17 hours." With timeout added, we'll see
+   `[flowhook] idle-timeout: device=…` in the logs — a permanent paper trail for this class
+   of failure.
+
+## 20. Deploy path for v0.3.2
+
+The APK got built locally and dropped at
+`https://sightless.dustforge.com/static/flowhook-test.apk` (md5 `5975a736…`). The Sightless
+server has a `/static/` mount so this was a zero-friction way to let the phone pull without
+going through a full GitHub release. Pattern for future ad-hoc tests: piggyback on
+Sightless's static dir when Flowhook itself is down.
+
+Server changes pushed by `cp` into `/home/claude/flowhook/server.py` (owned by `claude`, not
+`ky` — the sudo-as-claude dance) and `systemctl restart flowhook`. Service came up on the
+new code in ~1s. `/home/ky/Projects/Flowhook/server/server.py` also got a hotfix applied
+inline (`device_id = None; user_id = None` init before the auth try block) that had
+previously only existed on the live server — the repo and live copies are now identical.
+
+Full release (tag, GitHub Releases artifact, `app.apk` redirect pointing to it) happens
+after Kyle confirms the fix holds for ≥24h on his S22.
+
+## 21. Session metadata — session 2
+
+- **Date:** 2026-04-22
+- **Trigger:** Flowhook silently offline for the second day running; Kyle explicitly
+  requested "focus on Flowhook for now"
+- **Files touched:**
+  - `app/src/main/kotlin/com/dustforge/flowhook/FlowhookService.kt` (heartbeat, StateFlow,
+    notification text, onAuthenticated/onDisconnected hooks)
+  - `app/src/main/kotlin/com/dustforge/flowhook/MainActivity.kt` (WS state line, lifecycle
+    StateFlow collector)
+  - `server/server.py` (idle-timeout wrap on `ws.receive_text`, safety init merge-in)
+- **Versions:** v0.3.1 → v0.3.2
+- **Still not shipped:** GitHub Release + artifact publish (waiting on soak test)
+
+---
+
+# Session 3 — v0.3.3: Shizuku ripped out
+
+### 2026-04-22 (same day as session 2)
+
+Later the same afternoon Kyle gave a two-sentence directive: *"Shizuku has been deprecated
+from the stack. Flowhook handles all features now."* Then, after I described Shizuku as a
+"fallback": *"Shizuku is not a fallback, it is legacy but needs to be stripped from the work
+flow."* Self-managed ADB bridge is the sole execution path. Keeping Shizuku as dead code was
+adding permission prompts, manifest provider declarations, and a fallback branch in
+`Executor.exec` that would fire in exactly the confusing edge cases we don't want.
+
+## 22. The removal
+
+Surgical strip, not a rewrite:
+
+- `Executor.kt` — the `ShizukuExecutor.isReady() && hasPermission()` branch is gone. The
+  error message went from `"no shell bridge available (adb not connected, shizuku not
+  ready)"` to `"ADB bridge not connected — enable tcpip and reopen Flowhook"`. Single
+  actionable sentence. No users forced to think about two independent subsystems.
+- `ShizukuExecutor.kt` — deleted entirely.
+- `AndroidManifest.xml` — removed `moe.shizuku.manager.permission.API_V23` uses-permission,
+  the `<queries>` block for `moe.shizuku.privileged.api`, and the `ShizukuProvider`
+  `<provider>` declaration.
+- `app/build.gradle.kts` — dropped `dev.rikka.shizuku:api:13.1.5` and
+  `dev.rikka.shizuku:provider:13.1.5`.
+- `AdbExecutor.kt` / `CommandHandler.kt` — cleaned the "replaces Shizuku" / "via Shizuku"
+  comments so docstrings match the live architecture.
+
+## 23. What this exposes
+
+Removing the fallback sharpens the pressure on what was the real problem all along:
+**Flowhook has exactly one execution path, and that path requires `adb tcpip 5555` to be
+active on the phone.** If adbd reverts to USB-only mode (which Samsung's Android 16 does on
+every reboot unless `persist.adb.tcp.port` is set), Flowhook is dead in the water. Session 2
+fixed the WebSocket transport; this session made the shell transport a singleton. The next
+stability chunk is bridge-persistence across phone reboots — either via
+`persist.adb.tcp.port` written through WRITE_SECURE_SETTINGS once ADB is first connected,
+or via a boot-time auto-pair flow. Neither is built yet in v0.3.3; it's the obvious next
+session.
+
+## 24. Session metadata — session 3
+
+- **Date:** 2026-04-22 (afternoon, same day as session 2)
+- **Trigger:** User directive to strip Shizuku from the codebase
+- **Files touched:**
+  - `app/src/main/kotlin/com/dustforge/flowhook/Executor.kt` (rewrote without fallback)
+  - `app/src/main/kotlin/com/dustforge/flowhook/ShizukuExecutor.kt` (deleted)
+  - `app/src/main/AndroidManifest.xml` (removed permission, queries, provider)
+  - `app/build.gradle.kts` (dropped Shizuku deps; versionCode 9 → 10, versionName 0.3.2 → 0.3.3)
+  - `app/src/main/kotlin/com/dustforge/flowhook/AdbExecutor.kt` (doc comment)
+  - `app/src/main/kotlin/com/dustforge/flowhook/CommandHandler.kt` (doc comment)
+- **Versions:** v0.3.2 → v0.3.3
+- **Still not shipped:** GitHub Release. APK published ad-hoc to
+  `https://sightless.dustforge.com/static/flowhook-test.apk` (md5 `6cb4964e…`).
+- **Open:** adb tcpip persistence across phone reboots — next session's problem.
+
+---
+
+# Session 4 — v0.3.4: self-healing bridge + honest status
+
+### 2026-04-22 (evening of the same Shizuku-strip day)
+
+Right after v0.3.3 shipped, Kyle plugged his S22 into K1 over USB. The immediate question
+was no longer "does the bridge connect right now" (USB makes that trivial) but "will it
+still work tomorrow, after a phone reboot, without requiring Kyle to plug back in." The
+phone was in a surprisingly good state:
+
+- `persist.adb.tcp.port=5555` was still set from prior setup — meaning after reboot (and
+  unplug), adbd should auto-listen on 5555.
+- `android.permission.WRITE_SECURE_SETTINGS` was already granted to Flowhook — meaning
+  Flowhook can change ADB-related Global settings *from its own app process*, no shell
+  bridge required.
+- Shizuku was uninstalled by Kyle. Nothing depended on it anymore (as of v0.3.3).
+
+The underlying fragility: if Samsung's OneUI silently flipped `adb_enabled` or
+`adb_wifi_enabled` off — and it has been observed to do this after certain OTA events —
+Flowhook would be locked out until Kyle plugged in USB to manually re-enable. Kyle's
+desired shape: Flowhook should *self-heal*, aggressively re-asserting its own
+preconditions without requiring user intervention.
+
+## 25. What v0.3.4 changed
+
+### 25.1 `SettingsGuard.kt` — bootstrap rung without a shell
+
+New object with one public method: `reassert(ctx: Context): Boolean`. Uses
+`Settings.Global.putInt(cr, key, 1)` from app process to set:
+
+- `Settings.Global.ADB_ENABLED = 1` — USB debugging toggle
+- `adb_wifi_enabled = 1` — Android 11+ Wireless Debugging toggle
+
+Both writes are gated on `WRITE_SECURE_SETTINGS` (already granted). If the permission
+ever gets revoked, the calls `SecurityException` and `reassert` returns false; service
+continues normally without crashing. The point of doing this from app code (not shell)
+is that it works *even when the ADB bridge is down* — it's the only self-heal rung
+Flowhook has before the bridge is back.
+
+`SettingsGuard.reassert(ctx)` is now called from:
+
+- `FlowhookService.onCreate()` — every service start.
+- The adb supervisor loop — every ~5 minutes (30 × 10s ticks). Catches Samsung silently
+  flipping things between service starts.
+
+### 25.2 `AdbExecutor.ready: StateFlow<Boolean>`
+
+Mirrors v0.3.2's `wsConnected` pattern. The `_ready` flow flips true after a successful
+`connect()` probe, flips false on any `exec` failure or `disconnect`, and is observable
+from `AdbExecutor.ready`. Any consumer that needs live bridge state reads this instead
+of polling `isReady()`.
+
+`MainActivity.refreshStatus()` now binds:
+
+```kotlin
+lifecycleScope.launch {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        AdbExecutor.ready.collect { refreshStatus() }
+    }
+}
+```
+
+Same pattern as the WS state collector. The "ADB connected" status line now reflects the
+dadb handle, not just the toggle.
+
+### 25.3 Foreground notification surfaces both channels
+
+v0.3.2 text was `"Remote admin bridge: connected"` / `"…reconnecting…"` based on WS only.
+v0.3.4 text is one of:
+
+- `Remote admin bridge: connected (WS + ADB)`
+- `Remote admin bridge: WS up, ADB offline`
+- `Remote admin bridge: reconnecting (ADB up)`
+- `Remote admin bridge: reconnecting…`
+
+The WS-up-but-ADB-down state is a real configuration — the phone reaches the server fine,
+but any `/exec` returns "ADB bridge not connected" because adbd stopped listening. That's
+distinct from "server unreachable" and needs its own shade text so the user diagnoses
+correctly without opening the app.
+
+A new `adbWatcherJob` in `FlowhookService` collects `AdbExecutor.ready` and calls
+`updateNotification()` on every change. The existing WS watcher already re-issues the
+notification on WS state flips.
+
+### 25.4 Once-connected bridge self-heal
+
+The adb supervisor's post-connect block (previously: grant
+`WRITE_SECURE_SETTINGS` + `READ_LOGS`) now also runs:
+
+```
+setprop persist.adb.tcp.port 5555
+settings put global adb_enabled 1
+```
+
+Idempotent. If the props are already correct, these are no-ops. If anything drifted, the
+bridge re-plants the persistence. Note: `setprop persist.adb.tcp.port` is best-effort on
+Samsung — OneUI's SEPolicy *may* reject shell-user writes to persist.* contexts. It's
+still worth trying on every connect, and on devices where it works (earlier S22
+firmwares, Pixels, etc.) it's what makes the reboot path robust.
+
+## 26. The shape of "stable enough for Sightless as daily driver"
+
+Stability is layered. v0.3.2 fixed the top layer (socket liveness); v0.3.3 removed a
+legacy subsystem that was muddying the diagnostic signal; v0.3.4 makes Flowhook aggressive
+about re-asserting its own preconditions and honest about reporting them. What's still
+open:
+
+- **Phone reboot while unplugged.** If `persist.adb.tcp.port=5555` survives reboot (which
+  it did this time), adbd comes up listening on 5555 and Flowhook auto-reconnects within
+  ~10 seconds. If it doesn't survive (future Samsung update, security reset), Kyle needs
+  to plug in USB once to let Flowhook replant the prop. v0.3.4 makes this visible in the
+  notification so Kyle knows immediately.
+- **Wireless Debugging pairing** (Android 11+ mDNS pair-code flow) is a more robust
+  long-term path — the pairing persists across reboots even through SEPolicy resets. Not
+  implemented yet; next candidate for v0.4.x when Kyle observes a real
+  persist-prop-reset incident.
+
+## 27. Session metadata — session 4
+
+- **Date:** 2026-04-22 (evening)
+- **Trigger:** Kyle directive — "make Flowhook solid before we move on to Sightless."
+- **Files touched:**
+  - `app/src/main/kotlin/com/dustforge/flowhook/SettingsGuard.kt` (new file)
+  - `app/src/main/kotlin/com/dustforge/flowhook/AdbExecutor.kt` (added `ready` StateFlow,
+    flip on connect / exec fail / disconnect)
+  - `app/src/main/kotlin/com/dustforge/flowhook/FlowhookService.kt` (SettingsGuard
+    reassert on onCreate + periodic, adb watcher job, notification text covers both
+    channels, supervisor's post-connect self-heal block)
+  - `app/src/main/kotlin/com/dustforge/flowhook/MainActivity.kt` (ADB StateFlow
+    collector)
+  - `app/build.gradle.kts` (versionCode 10 → 11, versionName 0.3.3 → 0.3.4)
+- **Versions:** v0.3.3 → v0.3.4
+- **Verified on device:** Flowhook `exec` returned `uid=2000(shell)` end-to-end post-install.
+- **APK:** `https://sightless.dustforge.com/static/flowhook-test.apk` md5 `4bb387c2…`
+
+---
+
+# Session 5 — v0.3.5: K1-side polling recovery + push notifications
+
+### 2026-04-22 (late afternoon, same day)
+
+Kyle tested v0.3.4's survival across a full phone reboot. The wake-up path partially
+worked — the WebSocket came back up on boot (v0.3.2 pays off), but the ADB bridge stayed
+offline because `service.adb.tcp.port` is transient and Samsung's SEPolicy rejects shell
+writes to `persist.*` props. The notification faithfully reported "WS up, ADB offline"
+(v0.3.4 pays off), so Kyle knew within seconds what broke.
+
+Then we talked about how to make this self-heal without persistent wireless-debugging
+pairing. Kyle rejected pairing explicitly as a security posture: *"in this era of ever
+more intelligent AI, the user may want to shut their phone down if they suspect Flowhook
+has been compromised to kill that connection. A persistent connection would be a bug, not
+a feature."* The right shape is K1-side: poll for the phone on USB, re-arm tcpip when
+present.
+
+## 28. The K1 polling loop
+
+Three pieces:
+
+### 28.1 `~/bin/flowhook-adb-recovery.sh`
+
+Bash script, called on a 3-min systemd user timer. Design:
+
+- **Scoped by package, not device-ID.** `adb shell pm list packages | grep
+  com.dustforge.flowhook` — any Android plugged in that has Flowhook installed is
+  eligible. A dev tablet or a friend's phone without Flowhook is untouched. This keeps
+  the door open for sharing Flowhook with other users while still refusing to poke at
+  random devices.
+- **Idempotent.** Reads `getprop service.adb.tcp.port`; only runs `adb tcpip 5555` if the
+  port isn't already `5555`. If Kyle leaves the phone plugged in, the poll runs every
+  3 min but does nothing — no adbd churn, no 1-sec bridge gaps every poll.
+- **Consent gate preserved.** Samsung's "Allow USB debugging from this computer?" dialog
+  is still the security check — if the phone's owner taps Deny, `adb tcpip` returns
+  `device unauthorized`, which the script detects via regex and escalates to a phone
+  notification.
+- **Logs to `~/.flowhook/recovery.log`.** Only logs state changes (successful tcpip or
+  failures), not every 3-min no-op tick. `tail -f ~/.flowhook/recovery.log` is the single
+  observability line for this subsystem.
+
+### 28.2 `~/.config/systemd/user/flowhook-adb-recovery.{service,timer}`
+
+User-level systemd timer, `OnBootSec=30s` + `OnUnitActiveSec=3min`, enabled via
+`systemctl --user enable --now`. No root needed. K1 users can disable the timer
+trivially if they want to opt out. `AccuracySec=30s` prevents systemd from batching it
+into other timer storms — the polling stays on schedule.
+
+### 28.3 Push notifications — `POST /notify_device` + agent handler
+
+The silent-failure hole from the design review: if Kyle taps Deny on the ADB dialog
+because his phone was in his pocket and he didn't realize it'd popped up, the recovery
+script fails in a log file he'd never think to check. Kyle approved one notification-
+channel exception here — he keeps notifications sparse, but a bridge-recovery failure is
+a case where the phone chirping is the right UX.
+
+Server side (`server.py`):
+
+```python
+class NotifyReq(BaseModel):
+    title: str
+    text: str
+    device_id: str | None = None
+
+@app.post("/notify_device")
+async def notify_device(req: NotifyReq, claims: dict = Depends(require_user)):
+    agent = get_user_device(claims["uid"], req.device_id)
+    async with agent.lock:
+        await agent.ws.send_text(json.dumps({
+            "type": "notify", "title": req.title, "text": req.text,
+        }))
+    return {"ok": True}
+```
+
+Fire-and-forget — no `send_command`/Future dance because there's no reply. Audit log
+tracks every push.
+
+Agent side (`FlowhookService.kt`):
+
+- New WS message handler branch: `if (msg.optString("type") == "notify") showUserNotification(...)`
+- New notification channel `CH_ALERTS` at `IMPORTANCE_DEFAULT` (chirps and posts to
+  shade), distinct from the always-on service channels so users can tune it independently.
+- `showUserNotification` uses a rolling counter for the notification ID so consecutive
+  alerts don't collapse — each failure gets its own entry.
+
+### 28.4 Recovery script → notification integration
+
+When `adb tcpip 5555` returns unauthorized/error, the script POSTs to `/notify_device`
+with the full failure text. JSON escaping done via `python3 -c` to handle error messages
+that contain quotes, newlines, backslashes (which `printf %q` would mangle into invalid
+JSON).
+
+## 29. End-to-end verification
+
+- Phone plugged in → `adb devices` sees it → recovery script ran manually →
+  `[R5CT60SBX2L] tcpip not armed (service.adb.tcp.port=''); running adb tcpip 5555` →
+  `OK: restarting in TCP mode port: 5555`.
+- Immediately after: `/home/ky/bin/flowhook exec 'whoami'` → `shell`. Bridge live.
+- `curl -X POST /notify_device` with a test payload → `{"ok":true}`. Agent-side
+  notification not directly verified on-device in this session; will confirm on next
+  natural failure event.
+
+## 30. Why this closes "Flowhook solid enough to be Sightless's push pipeline"
+
+Layered coverage:
+
+| Failure mode | Layer that catches it |
+|---|---|
+| WebSocket silent disconnect | v0.3.2 heartbeat + idle-timeout |
+| Samsung flips `adb_enabled` off | v0.3.4 SettingsGuard re-assertion |
+| ADB bridge dies during session | v0.3.4 supervisor 10s retry loop |
+| Phone reboot while unplugged, `service.adb.tcp.port` resets | v0.3.5 K1 polling waits for plug-in |
+| User denies ADB auth dialog after plug-in | v0.3.5 notification tells them |
+| UI pretends "connected" when it isn't | v0.3.2 + v0.3.4 StateFlow binding |
+
+The remaining user ritual is "after a phone reboot, plug in for ≥3 min if you want your
+Flowhook back." Every other failure mode is self-healing. That meets the bar for making
+Sightless the daily driver.
+
+## 31. Session metadata — session 5
+
+- **Date:** 2026-04-22 (afternoon → evening)
+- **Trigger:** v0.3.4 reboot test exposed `persist.adb.tcp.port` isn't writable on
+  Samsung + Kyle's explicit rejection of persistent Wireless Debugging pairing on
+  security grounds.
+- **Files touched:**
+  - `/home/ky/bin/flowhook-adb-recovery.sh` (new, K1-side polling)
+  - `/home/ky/.config/systemd/user/flowhook-adb-recovery.{service,timer}` (new)
+  - `server/server.py` (added `/notify_device` endpoint + `NotifyReq` model)
+  - `app/src/main/kotlin/com/dustforge/flowhook/FlowhookService.kt` (CH_ALERTS channel,
+    showUserNotification, WS handler for type:"notify")
+  - `app/build.gradle.kts` (versionCode 11 → 12, versionName 0.3.4 → 0.3.5)
+- **Versions:** v0.3.4 → v0.3.5
+- **APK:** `https://sightless.dustforge.com/static/flowhook-test.apk` md5 `1df7912c…`
+- **Deployed:** server.py synced + `systemctl restart flowhook`. APK installed on-device
+  via USB ADB. Systemd user timer enabled via `systemctl --user enable --now`.

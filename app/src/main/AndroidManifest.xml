@@ -18,13 +18,6 @@
     <uses-permission android:name="android.permission.READ_LOGS"
         tools:ignore="ProtectedPermissions" />
 
-    <!-- Shizuku (kept as fallback; v0.2+ prefers self-managed ADB bridge) -->
-    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
-
-    <queries>
-        <package android:name="moe.shizuku.privileged.api" />
-    </queries>
-
     <application
         android:label="Flowhook"
         android:icon="@mipmap/ic_launcher"
@@ -63,14 +56,5 @@
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
-
-        <!-- Shizuku provider -->
-        <provider
-            android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="${applicationId}.shizuku"
-            android:multiprocess="false"
-            android:enabled="true"
-            android:exported="true"
-            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>

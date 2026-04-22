@@ -55,7 +55,7 @@ object CommandHandler {
             URL(apkUrl).openStream().use { input ->
                 FileOutputStream(tmp).use { out -> input.copyTo(out) }
             }
-            // Copy to /data/local/tmp via Shizuku to guarantee pm can read it under all SELinux profiles
+            // Copy to /data/local/tmp via the shell user so pm can read it under all SELinux profiles
             val stagePath = "/data/local/tmp/flowhook_install.apk"
             val copyRes = Executor.exec("cp ${tmp.absolutePath} $stagePath && chmod 644 $stagePath", 30_000)
             if (copyRes.exit != 0) {

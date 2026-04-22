@@ -3,9 +3,14 @@ package com.dustforge.flowhook
 import android.content.Context
 
 /**
- * Unified executor façade — prefers self-managed ADB bridge (v0.2+), falls back to Shizuku.
+ * Unified executor façade — routes all shell commands through Flowhook's
+ * self-managed ADB bridge.
  *
- * CommandHandler and clients should use this instead of AdbExecutor/ShizukuExecutor directly.
+ * v0.3.3: Shizuku was removed as a legacy dependency. Self-managed ADB is
+ * the sole execution path. If the bridge is down, commands fail fast with
+ * a single, actionable error — the caller is expected to surface that to
+ * the user (notification, UI, CLI exit), not silently fall back to a
+ * second mechanism that had its own independent failure modes.
  */
 object Executor {
     data class Result(val stdout: String, val stderr: String, val exit: Int, val source: String)
@@ -15,17 +20,9 @@ object Executor {
             val r = AdbExecutor.exec(cmd, timeoutMs)
             return Result(r.stdout, r.stderr, r.exit, "adb")
         }
-        if (ShizukuExecutor.isReady() && ShizukuExecutor.hasPermission()) {
-            val r = ShizukuExecutor.exec(cmd, timeoutMs)
-            return Result(r.stdout, r.stderr, r.exit, "shizuku")
-        }
-        return Result("", "no shell bridge available (adb not connected, shizuku not ready)", -99, "none")
+        return Result("", "ADB bridge not connected — enable tcpip and reopen Flowhook", -99, "none")
     }
 
-    fun status(ctx: Context): String {
-        val sb = StringBuilder()
-        sb.appendLine("adb:     ${if (AdbExecutor.isReady()) "connected on :${AdbExecutor.currentPort()}" else "offline"}")
-        sb.appendLine("shizuku: ready=${ShizukuExecutor.isReady()} perm=${ShizukuExecutor.hasPermission()}")
-        return sb.toString()
-    }
+    fun status(ctx: Context): String =
+        "adb: ${if (AdbExecutor.isReady()) "connected on :${AdbExecutor.currentPort()}" else "offline"}"
 }

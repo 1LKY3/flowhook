@@ -259,6 +259,8 @@ def list_devices(claims: dict = Depends(require_user)):
 async def agent_ws(ws: WebSocket):
     await ws.accept()
     # First frame: auth
+    device_id = None
+    user_id = None
     try:
         auth_raw = await asyncio.wait_for(ws.receive_text(), timeout=10)
         auth = json.loads(auth_raw)
@@ -280,9 +282,20 @@ async def agent_ws(ws: WebSocket):
     await ws.send_text(json.dumps({"type": "hello", "device_id": device_id}))
     print(f"[flowhook] agent online: device={device_id} user={user_id}")
 
+    # v0.3.2: server-side receive timeout. Clients ping every 20s app-level
+    # (plus OkHttp 15s protocol ping). If we see nothing at all for 90s the
+    # socket is dead — evict it so AGENTS doesn't leak phantom devices that
+    # cause /exec to hang or return 503 for no visible reason.
+    WS_IDLE_TIMEOUT = 90.0
     try:
         while True:
-            msg = await ws.receive_text()
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=WS_IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"[flowhook] idle-timeout: device={device_id} — closing")
+                try: await ws.close(code=1001, reason="idle timeout")
+                except Exception: pass
+                break
             data = json.loads(msg)
             # expected: {"req_id": "...", "ok": true/false, "stdout": "...", "stderr": "...", "exit": 0}
             req_id = data.get("req_id")
@@ -320,6 +333,32 @@ async def exec_cmd(req: ExecReq, claims: dict = Depends(require_user)):
     except asyncio.TimeoutError:
         audit_log(claims["uid"], agent.device_id, "exec", {"cmd": req.cmd}, "timeout")
         raise HTTPException(504, "command timed out")
+
+# v0.3.5: fire-and-forget notification push from the server to a specific
+# phone's Flowhook agent. Used by the K1 adb-recovery polling script to
+# surface failures on the phone so the user sees why their bridge didn't
+# come back up (e.g. they denied the ADB auth dialog). Does not wait for a
+# reply — the agent side renders a local Android notification.
+class NotifyReq(BaseModel):
+    title: str
+    text: str
+    device_id: str | None = None
+
+@app.post("/notify_device")
+async def notify_device(req: NotifyReq, claims: dict = Depends(require_user)):
+    agent = get_user_device(claims["uid"], req.device_id)
+    try:
+        async with agent.lock:
+            await agent.ws.send_text(json.dumps({
+                "type": "notify",
+                "title": req.title,
+                "text": req.text,
+            }))
+        audit_log(claims["uid"], agent.device_id, "notify", {"title": req.title}, "ok")
+        return {"ok": True}
+    except Exception as e:
+        audit_log(claims["uid"], agent.device_id, "notify", {"title": req.title}, "fail", str(e))
+        raise HTTPException(500, f"notify failed: {e}")
 
 class InstallReq(BaseModel):
     apk_url: str
