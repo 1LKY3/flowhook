@@ -55,6 +55,15 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
+            <!-- v0.3.7: self-replacement restart. Android only delivers
+                 ACTION_MY_PACKAGE_REPLACED to the app whose package was
+                 replaced (not the broader ACTION_PACKAGE_REPLACED which
+                 would fire for every other app too), so no permission
+                 or extra filtering is needed. Receiver is not exported
+                 for this action — the system delivers it directly. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
         </receiver>
     </application>
 </manifest>

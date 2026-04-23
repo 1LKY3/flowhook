@@ -59,6 +59,13 @@ class FlowhookService : Service() {
         super.onCreate()
         CommandHandler.appContext = applicationContext
         ensureChannels()
+        // v0.3.6: the companion StateFlow persists across service restarts
+        // within the same process. Reset it to false on every onCreate so
+        // a fresh service can't inherit a stale "connected" value from a
+        // prior life — the heartbeat tick will re-assert true once a real
+        // hello+pong round-trip lands.
+        _wsConnected.value = false
+        lastPongAt = 0L
         // v0.3.4: re-assert adb_enabled / adb_wifi_enabled on every service
         // start. No-op if Samsung hasn't touched them; self-heal if it has.
         SettingsGuard.reassert(applicationContext)
@@ -384,20 +391,35 @@ class FlowhookService : Service() {
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(HEARTBEAT_INTERVAL_MS)
-                val sock = ws ?: break
+                val sock = ws
                 val age = System.currentTimeMillis() - lastPongAt
-                if (age > HEARTBEAT_DEADLINE_MS) {
-                    Log.w(TAG, "heartbeat deadline exceeded (${age}ms since last pong) — forcing reconnect")
-                    // Cancelling the socket (vs close()) skips the graceful
-                    // close handshake that can itself hang on a dead TCP
-                    // connection — onFailure fires immediately.
-                    sock.cancel()
+                // v0.3.6: the app is its own source of truth for connection
+                // health. Do not wait for onFailure / onClosed to fire —
+                // under Doze + silent NAT rebinds OkHttp callbacks can go
+                // missing for hours, leaving the StateFlow stuck at true
+                // while the server has no record of us. Instead, re-derive
+                // _wsConnected on every tick from local data (pong age +
+                // socket presence). UI status reflects reality at each
+                // tick regardless of what OkHttp does or doesn't deliver.
+                val healthy = sock != null && age < HEARTBEAT_DEADLINE_MS
+                if (_wsConnected.value != healthy) {
+                    Log.i(TAG, "tick: _wsConnected ${_wsConnected.value} -> $healthy (age=${age}ms, sock=${sock != null})")
+                    _wsConnected.value = healthy
+                    updateNotification()
+                }
+                if (!healthy) {
+                    Log.w(TAG, "heartbeat declared unhealthy — cancelling socket + scheduling reconnect")
+                    sock?.cancel()
+                    if (currentMode == Mode.FULL) scheduleReconnect()
                     break
                 }
-                val ok = sock.send(JSONObject().put("type", "ping").toString())
+                val ok = sock!!.send(JSONObject().put("type", "ping").toString())
                 if (!ok) {
                     Log.w(TAG, "heartbeat send returned false — socket queue saturated, forcing reconnect")
+                    _wsConnected.value = false
+                    updateNotification()
                     sock.cancel()
+                    if (currentMode == Mode.FULL) scheduleReconnect()
                     break
                 }
             }
