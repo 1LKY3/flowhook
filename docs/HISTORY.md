@@ -1558,3 +1558,151 @@ Sightless the daily driver.
 - **APK:** `https://sightless.dustforge.com/static/flowhook-test.apk` md5 `1df7912c…`
 - **Deployed:** server.py synced + `systemctl restart flowhook`. APK installed on-device
   via USB ADB. Systemd user timer enabled via `systemctl --user enable --now`.
+
+---
+
+## 32. The v0.3.5 regression — stability that wasn't
+
+Session 5 closed with the claim that v0.3.5 "meets the bar for making Sightless the daily
+driver." Within the same day it didn't.
+
+Four hours after the green-light declaration, Kyle's phone's Flowhook card showed all
+seven checkmarks (WebSocket connected, ADB Bridge, ADB connected, Token configured,
+WRITE_SECURE_SETTINGS, Battery optimization exempt, Flowhook services). Our server had
+zero record of the phone. `last_seen` hadn't advanced in 4h06m. `/health` reported
+`online_devices: 0`. This is exactly the "green but lying" bug v0.3.2 was built to fix,
+resurrected.
+
+### Why our session-5 tests passed while reality failed
+
+Every test we ran in session 5 produced **clean events** — server restart generates a
+close frame, phone reboot generates an onClose, USB-unplug returns a 503. All of those
+paths run through OkHttp's `onFailure` / `onClosed` callbacks, which we trusted to flip
+`_wsConnected.value = false`.
+
+What we didn't test was the condition that actually kills Flowhook in the wild:
+**Android Doze + silent NAT rebind at the carrier level.** In that scenario the TCP
+socket dies without notifying OkHttp. No `onFailure`. No `onClose`. The StateFlow is
+never touched. The UI keeps rendering its last value — true — forever.
+
+The stability bar we set in section 30 was "every non-reboot failure mode is
+self-healing." We met it for every failure mode we could produce in a test environment.
+We missed the one that only shows up on a carrier network after a lock-screen tier-2
+Doze transition — a condition K1 + cable can't reproduce.
+
+### The architectural lesson Kyle named
+
+Kyle's frustration was sharp and precisely correct: *"the app should be checking to see
+if those connections are stable, not this server."* Event-driven state flipping is a
+puppet of callbacks that may never fire. For any system that must be authoritative about
+its own health, the app has to be its own source of truth — a local tick that re-derives
+state from things it can observe directly.
+
+---
+
+## 33. v0.3.6 — heartbeat tick becomes authoritative
+
+Old (v0.3.2 through v0.3.5):
+```kt
+if (age > HEARTBEAT_DEADLINE_MS) {
+    sock.cancel()
+    break                       // assumes onFailure will flip the flag
+}
+```
+This assumes `sock.cancel()` triggers `onFailure` reliably. Under Doze, it doesn't.
+
+New:
+```kt
+val healthy = sock != null && age < HEARTBEAT_DEADLINE_MS
+if (_wsConnected.value != healthy) {
+    _wsConnected.value = healthy
+    updateNotification()
+}
+if (!healthy) {
+    sock?.cancel()
+    if (currentMode == Mode.FULL) scheduleReconnect()
+    break
+}
+```
+Every 20s, the app looks at data it *owns* — `lastPongAt` and whether `ws` is non-null —
+and authoritatively sets the flag. OkHttp's callbacks become a secondary signal rather
+than the primary one. `onAuthenticated` still flips the flag true after the hello +
+first pong, but it no longer *holds* it true; the next tick re-verifies.
+
+`onCreate` also now resets `_wsConnected.value = false` and `lastPongAt = 0L` so a
+service restart within the same process can't inherit a stale true from the previous
+life.
+
+### Mandatory stability tests going forward
+
+- **Airplane-mode toggle** — turn on airplane mode for 60s with Flowhook foregrounded;
+  the card must flip from seven ticks to "reconnecting" within 30s. This is the minimum
+  test that would have caught today's bug in session 5.
+- **Wi-Fi kill mid-session** — disable Wi-Fi without re-enabling; same 30s hard deadline.
+
+These are the new non-negotiables before declaring any Flowhook version stable.
+
+---
+
+## 34. v0.3.7 — self-replacement restart (band-aid removal)
+
+v0.3.6 fixed the green-but-lying bug but was delivered in a way that exposed another
+gap: Flowhook can't deliver its own update when it's the broken thing. Kyle's v0.3.5
+was silently dead, so `flowhook install` returned 503 "no device online." The recovery
+script's USB path (`adb install -r`) was the only way to land v0.3.6.
+
+After `adb install -r`, the running Flowhook process is killed. Android then leaves the
+app installed but **stopped** — no receiver existed for `ACTION_MY_PACKAGE_REPLACED`,
+so the foreground service didn't come back on its own. v0.3.6's recovery script worked
+around this by following `adb install -r` with `adb shell am start -n .MainActivity` to
+poke the app awake.
+
+Kyle caught this pattern and named it: *"when you band-aid shit and fix it yourself
+while ignoring how the applications are supposed to work, it sets us back. It literally
+is negative work."* An external script reaching into the app to start a service is
+exactly the kind of coupling that has to be undone later.
+
+v0.3.7 fixes it inside the app. `BootReceiver` now listens for
+`ACTION_MY_PACKAGE_REPLACED` in addition to `BOOT_COMPLETED`, and starts
+`FlowhookService` in the appropriate mode. The recovery script's `am start` is removed;
+the script's job is pure USB lifecycle (install + tcpip-arm), and the app owns its own
+resurrection after install.
+
+Also reinforces a separation that came up repeatedly this session: **Flowhook and
+Sightless must stay architecturally independent.** Flowhook is Kyle's dev-workflow
+dependency, not a Sightless requirement. End users of Sightless must be able to control
+their computer and chat interfaces without Flowhook installed. Recovery script stays
+Flowhook-only; Sightless is never co-delivered by this path.
+
+---
+
+## 35. Session metadata — session 6
+
+- **Date:** 2026-04-22 (evening — post-compact continuation of session 5)
+- **Trigger:** Kyle's Flowhook card showed all-green but server reported the device
+  offline for 4h06m. v0.3.5's "authoritative" StateFlow was lying.
+- **Files touched:**
+  - `app/src/main/kotlin/com/dustforge/flowhook/FlowhookService.kt` (tick-driven
+    `_wsConnected`, onCreate reset of companion state)
+  - `app/src/main/kotlin/com/dustforge/flowhook/BootReceiver.kt` (handle
+    `ACTION_MY_PACKAGE_REPLACED`)
+  - `app/src/main/AndroidManifest.xml` (second intent-filter for MY_PACKAGE_REPLACED)
+  - `app/build.gradle.kts` (versionCode 12 → 14, versionName 0.3.5 → 0.3.7 — skipped
+    through 0.3.6 in one commit since both diffs landed in the same session)
+  - `/home/ky/bin/flowhook-adb-recovery.sh` (extended to read
+    `~/.flowhook/staged/flowhook.apk.version`, compare to installed version, run
+    `adb install -r` on mismatch; `am start` band-aid removed after v0.3.7 receiver
+    shipped)
+  - `/home/ky/.flowhook/staged/flowhook.apk` (canonical K1-side staged build location
+    new this session; companion `.version` file holds the versionName for diff-driven
+    updates)
+- **Versions:** v0.3.5 → v0.3.7 (v0.3.6 existed briefly as the tick-driven-watchdog
+  intermediate; v0.3.7 adds the MY_PACKAGE_REPLACED receiver and is the first build
+  that actually meets the session-5 claim of "stable enough as Sightless push pipeline.")
+- **Deployed:** v0.3.6 delivered via USB recovery script on Kyle's plug-in at 18:08 PDT
+  (WS back online within seconds, verified `online_devices: 1`, ADB bridge source).
+  v0.3.7 staged at `/home/ky/.flowhook/staged/flowhook.apk` awaiting next plug-in.
+- **Dead ends:** the initial attempt to send a tray notification telling Kyle to
+  reinstall required Flowhook to be alive to display the notification, which is the
+  exact thing that was broken — chicken-and-egg. Confirmed: a broken Flowhook can't
+  deliver its own fix via Flowhook.
