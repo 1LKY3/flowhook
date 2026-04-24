@@ -1706,3 +1706,65 @@ Flowhook-only; Sightless is never co-delivered by this path.
   reinstall required Flowhook to be alive to display the notification, which is the
   exact thing that was broken — chicken-and-egg. Confirmed: a broken Flowhook can't
   deliver its own fix via Flowhook.
+
+---
+
+## 36. Crawler-defense audit (2026-04-24)
+
+Not a code change this session — a lesson from the Sightless Flimflam-vhost access
+log, captured here because Flowhook sits on the same Racknerd front and inherits
+most of the same attacker classes.
+
+**What happened.** After `sightless-flimflam-all-series.dustforge.com` went live on
+2026-04-23, anonymous scanners found the new hostname within hours. The first 18
+hours of the vhost's access log held ~500 requests from ~13 distinct source IPs
+across AWS us-west-2, AWS eu-west-1, and various residential NATs — all using
+rotated generic browser User-Agents (iPhone, Mac, Windows, Linux x86_64), all
+probing `/api/screen/*`, `/wp-login.php`, `/.git/config`, `/assets/js/auth.js`,
+etc. None of them fetched robots.txt before hitting endpoints. Several hit it
+after — almost certainly to appear compliant in case anyone checked the logs.
+
+**The three-layer model, tested against real traffic.** Sightless's vhost has three
+crawler-defense layers stacked (D82 in its CONTEXT.md). Against tonight's scanners:
+
+| Layer | Blocks | Stopped tonight's scanners? |
+|---|---|---|
+| `robots.txt` `Disallow: /` | Well-behaved crawlers that voluntarily respect it (Google, Bing, GPTBot, ClaudeBot, Google-Extended) | **No.** Scanners ignored it entirely. |
+| nginx `$is_ai_crawler` UA blocklist (`/etc/nginx/conf.d/ai_crawler_map.conf`) | Crawlers that identify themselves honestly in the User-Agent | **No.** Scanners used rotated generic Chrome/iPhone UAs. |
+| `allow 100.64.0.0/10; deny all;` on sensitive endpoints | Every caller not on the tailnet, regardless of UA or robots compliance | **Yes.** All `/api/screen/*` attempts returned 403. |
+
+**"AWS scanners" = third parties on EC2, not Amazon.** Worth naming explicitly so
+future readers don't assume this is somehow Amazon's own infra probing. The
+scanners are attackers renting cheap AWS compute because cloud IPs rotate fast and
+don't tie back to them personally. Same story for DigitalOcean, Linode, OVH,
+Hetzner — every cheap VPS provider's address space is attacker-adjacent by default.
+
+**Flowhook's posture today, for the record.**
+
+- **Per-endpoint JWT auth** on every operational endpoint (`/exec`, `/install`,
+  `/screencap`, `/logcat`, `/notify_device`, `/devices`, etc.). Unauthenticated
+  scanners get 401s — real data stays behind the lock. This is the structural
+  difference from Sightless's current un-authed posture.
+- **Nginx rate limiting** (`zone=flowhook_api:10m rate=20r/s; burst=40`). Slows
+  volumetric probes but doesn't reject them.
+- **No `robots.txt`.** Landing page + `/signup` + `/context` (the full build
+  report) + `/context/flowhook.md` are all publicly indexable by well-behaved
+  crawlers today. Violates the "robots.txt on every public project, day one" rule
+  Kyle named after the Sightless-GPTBot postmortem. **Open call:** either add
+  `robots.txt` `Disallow: /` + the `$is_ai_crawler` UA block to mirror Sightless,
+  or explicitly accept that the build report is meant to be SEO-discoverable
+  marketing material and document that as policy. Whichever — the rule needs to
+  be honored or overridden on purpose.
+- **No `$is_ai_crawler` UA block** applied to this vhost. Same question hangs on
+  the same policy decision as robots.txt.
+
+**What this doesn't threaten.** The Bearer-token auth layer is doing real work —
+credential compromise / device takeover is locked behind JWT, not robots.txt.
+The crawler-defense question for Flowhook is a surface-hygiene / brand-control
+question (who indexes the build report) and a bandwidth-budget question (volumetric
+scraping of the landing page). Worth fixing, not urgent.
+
+**Recommendation for next session.** Make the robots.txt / UA-block call
+explicitly for Flowhook. Sightless is closed-source + commercial so its posture is
+unambiguous; Flowhook is open-source + recruiting-forward so the calculus differs.
+Log the decision here once it lands.
