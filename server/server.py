@@ -283,10 +283,10 @@ async def agent_ws(ws: WebSocket):
     print(f"[flowhook] agent online: device={device_id} user={user_id}")
 
     # v0.3.2: server-side receive timeout. Clients ping every 20s app-level
-    # (plus OkHttp 15s protocol ping). If we see nothing at all for 90s the
-    # socket is dead — evict it so AGENTS doesn't leak phantom devices that
-    # cause /exec to hang or return 503 for no visible reason.
-    WS_IDLE_TIMEOUT = 90.0
+    # (plus OkHttp 15s protocol ping). 300s tolerates Doze-deferred pings
+    # without false evictions — 90s was too aggressive and caused phantom
+    # disconnect state (client green, server 503).
+    WS_IDLE_TIMEOUT = 300.0
     try:
         while True:
             try:

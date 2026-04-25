@@ -1768,3 +1768,62 @@ scraping of the landing page). Worth fixing, not urgent.
 explicitly for Flowhook. Sightless is closed-source + commercial so its posture is
 unambiguous; Flowhook is open-source + recruiting-forward so the calculus differs.
 Log the decision here once it lands.
+
+---
+
+## §37 Stability test battery and WS idle timeout fix — 2026-04-25
+
+### The test battery
+
+Ran a systematic stability battery against every Flowhook connection point. Nine tests
+exercising server kill/crash recovery, client toggle cycles, ADB bridge disable/re-enable,
+app force-stop/relaunch, and screen-off persistence under Doze.
+
+**Test conditions matter.** The first battery run had USB plugged in. Screen-off test 9
+failed at the 3-minute mark — WS dropped and did not self-recover. The phone UI showed
+"WebSocket connected" (green check) while the server returned 503 "no device online."
+We suspected USB charging-state transitions were corrupting results. Unplugged USB,
+switched to Tailscale ADB (`100.123.253.44:5555`) as the sole control path, and re-ran
+the full battery. All 9 tests passed — including 5 minutes of screen-off + forced Doze.
+
+### Root cause: WS_IDLE_TIMEOUT too aggressive
+
+The server's `WS_IDLE_TIMEOUT` was 90 seconds. The client's app-level heartbeat sends
+pings every 20 seconds via a Kotlin coroutine `delay()`. Under Android Doze, coroutine
+timers on `Dispatchers.IO` can be batched and deferred by the OS — even with a
+`PARTIAL_WAKE_LOCK` held. A 20-second ping stretched past 90 seconds triggers server-side
+eviction (`unregister_agent`), but the client's `_wsConnected` StateFlow can remain `true`
+if OkHttp callbacks are also deferred. This creates a phantom connection state: client
+shows green, server has no device, exec returns 503.
+
+The reconnect loop makes it worse: the client reconnects, authenticates (gets "hello"),
+flips `_wsConnected = true`, but the next Doze-deferred ping triggers another eviction.
+Connect → evict → reconnect → evict, with the UI flickering between states too fast to
+display or too slow to update.
+
+### Fix
+
+`WS_IDLE_TIMEOUT` bumped from 90s to 300s in `server.py`. The client's 20s heartbeat
+ping would need to be delayed by 5 full minutes under Doze to trigger a false eviction —
+well beyond even the deepest Doze maintenance window. No app-side changes needed.
+
+### Post-fix retest
+
+Re-ran screen-off + forced Doze combined test (the hardest scenario) with the 300s
+timeout. 5/5 checks passed over 5 minutes, WS stayed alive the entire time.
+
+### The battery (reference)
+
+| # | Test | Pass criteria |
+|---|------|---------------|
+| 0 | Baseline | All 7 checkmarks green, exec returns output |
+| 1 | Server kill (SIGTERM) | Phone reconnects, exec works within 30s |
+| 2 | Server crash (SIGKILL) | Same as test 1 |
+| 3 | Client services toggle OFF/ON | OFF: Mode IDLE, 503. ON: all green in 10s |
+| 4 | ADB Bridge toggle OFF/ON | OFF: ADB X marks. Re-arm via Tailscale `adb tcpip 5555`, toggle ON |
+| 5 | Force-stop + relaunch | 503 while stopped, all green within 10s of relaunch |
+| 6 | Screen off 5min | exec every 60s x5, all pass |
+| 7 | Doze force-idle | exec works during deep idle |
+| 8 | Screen off + Doze combined | exec every 60s x5, all pass — real pocket scenario |
+
+**Critical:** USB must be unplugged for tests 6-8. Use Tailscale ADB only.
