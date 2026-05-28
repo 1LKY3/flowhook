@@ -1,9 +1,9 @@
 """
-Flowhook — Shizuku-backed remote phone control plane.
+Flowhook — remote phone control plane.
 
 - Phones dial out via WebSocket at /agent, auth via JWT bearer token.
 - Callers (Claude Code / CLI) hit REST endpoints to execute commands on enrolled phones.
-- Server brokers command → phone → Shizuku → response.
+- Server brokers command → phone → embedded ADB client (dadb) → response.
 """
 import asyncio
 import hashlib
@@ -22,6 +22,7 @@ from pathlib import Path
 import bcrypt
 import jwt
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -78,6 +79,16 @@ def init_db():
             last_seen REAL,
             created_at REAL NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS device_access (
+            user_id INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            granted_by INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (user_id, device_id),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (device_id) REFERENCES devices(id),
+            FOREIGN KEY (granted_by) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,25 +163,41 @@ class Agent:
 AGENTS: dict[str, Agent] = {}  # device_id -> Agent
 USER_AGENTS: dict[int, set[str]] = {}  # user_id -> set of device_ids
 
-def register_agent(agent: Agent):
+def register_agent(agent: Agent) -> Agent | None:
+    previous = AGENTS.get(agent.device_id)
     AGENTS[agent.device_id] = agent
     USER_AGENTS.setdefault(agent.user_id, set()).add(agent.device_id)
+    return previous
 
-def unregister_agent(device_id: str):
-    agent = AGENTS.pop(device_id, None)
-    if agent:
-        USER_AGENTS.get(agent.user_id, set()).discard(device_id)
+def unregister_agent(device_id: str, agent: Agent | None = None) -> bool:
+    current = AGENTS.get(device_id)
+    if not current or (agent is not None and current is not agent):
+        return False
+    AGENTS.pop(device_id, None)
+    USER_AGENTS.get(current.user_id, set()).discard(device_id)
+    return True
+
+def get_accessible_devices(user_id: int) -> set[str]:
+    """Return device IDs this user can access (owned + shared)."""
+    owned = USER_AGENTS.get(user_id, set())
+    with db() as c:
+        shared = {r["device_id"] for r in c.execute(
+            "SELECT device_id FROM device_access WHERE user_id=?", (user_id,)
+        ).fetchall()}
+    return {d for d in (owned | shared) if d in AGENTS}
 
 def get_user_device(user_id: int, device_id: str | None) -> Agent:
-    devices = USER_AGENTS.get(user_id, set())
-    if not devices:
+    accessible = get_accessible_devices(user_id)
+    if not accessible:
         raise HTTPException(503, "no device online for this user")
     if device_id:
-        if device_id not in devices:
-            raise HTTPException(404, f"device {device_id} not online")
+        if device_id not in accessible:
+            raise HTTPException(404, f"device {device_id} not online or not accessible")
         return AGENTS[device_id]
-    # default: pick first
-    return AGENTS[next(iter(devices))]
+    # default: pick first owned, then shared
+    owned_online = USER_AGENTS.get(user_id, set()) & set(AGENTS.keys())
+    pick = next(iter(owned_online)) if owned_online else next(iter(accessible))
+    return AGENTS[pick]
 
 # ---------------------------------------------------------------------------
 # Audit
@@ -239,20 +266,72 @@ def enroll_device(req: DeviceReq, claims: dict = Depends(require_user)):
 
 @app.get("/devices")
 def list_devices(claims: dict = Depends(require_user)):
+    uid = claims["uid"]
     with db() as c:
-        rows = c.execute(
-            "SELECT id, name, last_seen FROM devices WHERE user_id=?",
-            (claims["uid"],),
+        owned = c.execute(
+            "SELECT id, name, last_seen FROM devices WHERE user_id=?", (uid,),
+        ).fetchall()
+        shared = c.execute(
+            "SELECT d.id, d.name, d.last_seen FROM devices d "
+            "JOIN device_access da ON d.id = da.device_id "
+            "WHERE da.user_id=?", (uid,),
         ).fetchall()
     out = []
-    for r in rows:
+    for r in owned:
         out.append({
-            "device_id": r["id"],
-            "name": r["name"],
-            "last_seen": r["last_seen"],
-            "online": r["id"] in AGENTS,
+            "device_id": r["id"], "name": r["name"],
+            "last_seen": r["last_seen"], "online": r["id"] in AGENTS,
+            "access": "owner",
+        })
+    for r in shared:
+        out.append({
+            "device_id": r["id"], "name": r["name"],
+            "last_seen": r["last_seen"], "online": r["id"] in AGENTS,
+            "access": "shared",
         })
     return {"devices": out}
+
+# ---- Device sharing ------------------------------------------------------
+class ShareReq(BaseModel):
+    device_id: str
+    username: str
+
+@app.post("/devices/share")
+def share_device(req: ShareReq, claims: dict = Depends(require_user)):
+    """Grant another user access to one of your devices."""
+    uid = claims["uid"]
+    with db() as c:
+        device = c.execute("SELECT user_id FROM devices WHERE id=?", (req.device_id,)).fetchone()
+        if not device or device["user_id"] != uid:
+            raise HTTPException(403, "you don't own this device")
+        target = c.execute("SELECT id FROM users WHERE username=?", (req.username,)).fetchone()
+        if not target:
+            raise HTTPException(404, f"user '{req.username}' not found")
+        if target["id"] == uid:
+            raise HTTPException(400, "can't share with yourself")
+        try:
+            c.execute(
+                "INSERT INTO device_access (user_id, device_id, granted_by, created_at) VALUES (?, ?, ?, ?)",
+                (target["id"], req.device_id, uid, time.time()),
+            )
+        except sqlite3.IntegrityError:
+            return {"ok": True, "message": "already shared"}
+    return {"ok": True, "message": f"shared {req.device_id} with {req.username}"}
+
+@app.post("/devices/unshare")
+def unshare_device(req: ShareReq, claims: dict = Depends(require_user)):
+    """Revoke another user's access to one of your devices."""
+    uid = claims["uid"]
+    with db() as c:
+        device = c.execute("SELECT user_id FROM devices WHERE id=?", (req.device_id,)).fetchone()
+        if not device or device["user_id"] != uid:
+            raise HTTPException(403, "you don't own this device")
+        target = c.execute("SELECT id FROM users WHERE username=?", (req.username,)).fetchone()
+        if not target:
+            raise HTTPException(404, f"user '{req.username}' not found")
+        c.execute("DELETE FROM device_access WHERE user_id=? AND device_id=?",
+                  (target["id"], req.device_id))
+    return {"ok": True, "message": f"unshared {req.device_id} from {req.username}"}
 
 # ---- Agent WebSocket -----------------------------------------------------
 @app.websocket("/agent")
@@ -276,10 +355,15 @@ async def agent_ws(ws: WebSocket):
         return
 
     agent = Agent(device_id, user_id, ws)
-    register_agent(agent)
+    previous = register_agent(agent)
     with db() as c:
         c.execute("UPDATE devices SET last_seen=? WHERE id=?", (time.time(), device_id))
     await ws.send_text(json.dumps({"type": "hello", "device_id": device_id}))
+    if previous and previous is not agent:
+        try:
+            await previous.ws.close(code=4000, reason="replaced by newer connection")
+        except Exception:
+            pass
     print(f"[flowhook] agent online: device={device_id} user={user_id}")
 
     # v0.3.2: server-side receive timeout. Clients ping every 20s app-level
@@ -312,10 +396,12 @@ async def agent_ws(ws: WebSocket):
     except Exception as e:
         print(f"[flowhook] ws error: {e}")
     finally:
-        unregister_agent(device_id)
-        with db() as c:
-            c.execute("UPDATE devices SET last_seen=? WHERE id=?", (time.time(), device_id))
-        print(f"[flowhook] agent offline: device={device_id}")
+        if unregister_agent(device_id, agent):
+            with db() as c:
+                c.execute("UPDATE devices SET last_seen=? WHERE id=?", (time.time(), device_id))
+            print(f"[flowhook] agent offline: device={device_id}")
+        else:
+            print(f"[flowhook] stale socket closed: device={device_id}")
 
 # ---- REST command endpoints ---------------------------------------------
 class ExecReq(BaseModel):
@@ -333,6 +419,36 @@ async def exec_cmd(req: ExecReq, claims: dict = Depends(require_user)):
     except asyncio.TimeoutError:
         audit_log(claims["uid"], agent.device_id, "exec", {"cmd": req.cmd}, "timeout")
         raise HTTPException(504, "command timed out")
+
+
+class RecoverAdbReq(BaseModel):
+    device_id: str | None = None
+    timeout: float = 45.0
+
+
+@app.post("/recover_adb")
+async def recover_adb(req: RecoverAdbReq = Body(default_factory=RecoverAdbReq), claims: dict = Depends(require_user)):
+    """Explicit manual ADB recovery.
+
+    This sends a non-shell command over the phone's WebSocket, so it can run
+    when the WebSocket is alive but the dadb bridge is dead. It may restart
+    adbd and disrupt USB/Android Auto; never call it from background loops.
+    """
+    agent = get_user_device(claims["uid"], req.device_id)
+    try:
+        res = await agent.send_command({"type": "recover_adb"}, timeout=req.timeout)
+        audit_log(
+            claims["uid"],
+            agent.device_id,
+            "recover_adb",
+            {"manual": True},
+            "ok" if res.get("ok") else "fail",
+            (res.get("stdout", "") or "") + (res.get("stderr", "") or "") + (res.get("error", "") or ""),
+        )
+        return res
+    except asyncio.TimeoutError:
+        audit_log(claims["uid"], agent.device_id, "recover_adb", {"manual": True}, "timeout")
+        raise HTTPException(504, "ADB recovery timed out")
 
 # v0.3.5: fire-and-forget notification push from the server to a specific
 # phone's Flowhook agent. Used by the K1 adb-recovery polling script to
@@ -385,6 +501,24 @@ async def uninstall(req: UninstallReq, claims: dict = Depends(require_user)):
     res = await agent.send_command({"type": "uninstall", "package": req.package}, timeout=30)
     audit_log(claims["uid"], agent.device_id, "uninstall", {"package": req.package}, "ok" if res.get("ok") else "fail")
     return res
+
+class RubinReq(BaseModel):
+    provider: str = "list"
+    limit: int = 100
+    device_id: str | None = None
+
+@app.post("/rubin")
+async def rubin_query(req: RubinReq, claims: dict = Depends(require_user)):
+    agent = get_user_device(claims["uid"], req.device_id)
+    try:
+        res = await agent.send_command(
+            {"type": "rubin", "provider": req.provider, "limit": req.limit},
+            timeout=30,
+        )
+        audit_log(claims["uid"], agent.device_id, "rubin", {"provider": req.provider}, "ok" if res.get("ok") else "fail")
+        return res
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "rubin query timed out")
 
 class TapReq(BaseModel):
     x: int

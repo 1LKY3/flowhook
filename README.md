@@ -2,7 +2,7 @@
 
 **Full phone control for Claude Code.**
 
-Flowhook gives any authorized caller — your CLI, a Claude Code session, a shell script — full `adb shell`-level control over an Android phone over the open internet. Install APKs, run shell commands, simulate taps, grab screenshots, read logcat. No USB cable. No Wi-Fi. Works over cell data from anywhere.
+Flowhook gives any authorized caller — your CLI, a Claude Code session, a shell script — full `adb shell`-level control over an Android phone over the open internet. Install APKs, run shell commands, simulate taps, grab screenshots, read logcat. No root. No external daemons. Works over cell data from anywhere.
 
 **Live site & APK download:** https://flowhook.dustforge.com
 
@@ -10,7 +10,7 @@ Flowhook gives any authorized caller — your CLI, a Claude Code session, a shel
 
 ## What it is
 
-A small FastAPI server + an Android companion app. The phone dials out to your server and keeps a WebSocket open. The server exposes a REST API. When you (or an agent) hit the API, the command travels down the socket, executes on the phone via [Shizuku](https://shizuku.rikka.app/)'s `shell`-user Binder IPC, and the result comes back. Everything a wired `adb shell` can do, Flowhook can do — from any network.
+A small FastAPI server + an Android companion app. The phone dials out to your server over a persistent WebSocket. The server exposes a REST API. When you (or an agent) hit the API, the command travels down the socket, executes on the phone via an embedded ADB client ([dadb](https://github.com/nickvdyck/dadb)) connecting to localhost adbd, and the result comes back as shell user (uid 2000). Everything a wired `adb shell` can do, Flowhook can do — from any network.
 
 ## Why it exists
 
@@ -30,7 +30,11 @@ flowhook/
 
 ## Quick start (users)
 
-1. **Install Shizuku** on the phone. Pair it via Wireless Debugging. Confirm "Shizuku is running."
+1. **One-time ADB setup.** Connect the phone via USB, enable Developer Options → USB Debugging, then run:
+   ```bash
+   adb tcpip 5555
+   ```
+   This tells adbd to listen on TCP so Flowhook's embedded ADB client can connect locally. Persists until reboot.
 2. **Download the APK:** https://flowhook.dustforge.com/app.apk
 3. **Register and enroll** at the server:
    ```bash
@@ -47,7 +51,7 @@ flowhook/
      -d '{"name":"my phone"}'
    # → returns {device_id, agent_token, enroll_token}
    ```
-4. **Open Flowhook on the phone.** Paste server URL `wss://flowhook.dustforge.com/agent` and the `agent_token` from step 3. Save. Grant Shizuku permission. Hit all three "KEEP ALIVE" buttons.
+4. **Open Flowhook on the phone.** Paste server URL `wss://flowhook.dustforge.com/agent` and the `agent_token` from step 3. Save. Grant battery exemptions when prompted (keeps the foreground service alive).
 5. **Run a command:**
    ```bash
    curl -s -X POST $FLOW/exec \
@@ -105,7 +109,7 @@ See [the landing page](https://flowhook.dustforge.com/#api) for the full API ref
 | `GET` | `/devices` | user | list enrolled devices |
 | `WS` | `/agent` | (first frame) | phone dials in here |
 | `POST` | `/exec` | user | run shell command on phone |
-| `POST` | `/install` | user | silent APK install via Shizuku |
+| `POST` | `/install` | user | silent APK install via `pm install` |
 | `POST` | `/uninstall` | user | `pm uninstall` |
 | `POST` | `/tap` \| `/text` \| `/key` | user | synthetic input |
 | `GET` | `/logcat` | user | recent logcat |
@@ -119,25 +123,26 @@ See [the landing page](https://flowhook.dustforge.com/#api) for the full API ref
 2. User enrolls a phone → server mints a long-lived agent token bound to that phone.
 3. Phone opens a WebSocket to `/agent`, sends the agent token as the first frame.
 4. Server holds the socket. Outbound-only from phone — no inbound ports, carrier NAT irrelevant.
-5. Caller hits `/exec`. Server marshals command → phone → Shizuku → uid 2000 (shell) exec → response.
-6. Every command logged to audit.
+5. Caller hits `/exec`. Server marshals command down the WebSocket → phone's embedded ADB client (dadb) connects to localhost adbd → shell exec as uid 2000 → result back up the socket → REST response.
+6. A supervisor coroutine retries the ADB bridge every 10s if it drops. App-level heartbeat (20s ping / 30s deadline) detects dead sockets faster than TCP keepalive.
+7. Every command logged to audit.
 
 ## Limitations
 
-- **Shizuku dies on reboot.** Re-pair via Wireless Debugging (any Wi-Fi, including a temporary hotspot). 30-second ritual. If your phone rarely reboots, this is a non-issue.
+- **ADB bridge resets on reboot.** The app has a "Recover ADB Bridge" button that can cycle adbd via `Settings.Global` without USB. If that fails, plug in USB briefly and run `adb tcpip 5555` — the supervisor reconnects automatically.
 - **Shell user, not root.** Writing system partitions or modifying other apps' private data still requires root. Flowhook won't help with that.
-- **OEM battery aggression.** Samsung (OneUI) and some Chinese OEMs will kill background services even with Android's standard exemptions. Flowhook's app prompts for all three: battery-optimization ignore, Samsung "Never sleeping apps," and App-info → Unrestricted. Grant all three.
+- **OEM battery aggression.** Samsung (OneUI) and some Chinese OEMs will kill background services even with Android's standard exemptions. Flowhook prompts for battery-optimization ignore, Samsung "Never sleeping apps," and App-info → Unrestricted. Grant all three.
 
 ## Security
 
 - Transport is `wss://` (WebSocket over TLS) — same encryption as HTTPS, same Let's Encrypt cert.
 - Tokens are bearer JWTs. Treat them like SSH keys. Rotate via uninstall/re-enroll or by changing `FLOWHOOK_JWT_SECRET` (invalidates all).
-- Shizuku privileges = `shell` user. Not root.
+- Execution runs as `shell` user (uid 2000). Not root.
 - **Dual-use.** Don't install Flowhook on a phone you don't own. Don't hand tokens to anyone you wouldn't hand your unlocked phone to.
 
 ## Related project
 
-**[Sightless](https://sightless.dustforge.com)** — voice-driven remote control for your agent army. Separate product, separate APK, no Shizuku dependency (commercial subscription).
+**[Sightless](https://sightless.dustforge.com)** — accessibility-first remote control for AI agents. Separate product, separate APK (commercial).
 
 ## License
 
