@@ -78,6 +78,13 @@ class FlowhookService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_APPROVE_UPDATE) {
+            val requestId = intent.getStringExtra(EXTRA_UPDATE_REQUEST_ID).orEmpty()
+            applyMode(chooseMode())
+            ensureAdbStateWatcher()
+            sendUpdateApproval(requestId)
+            return START_STICKY
+        }
         val desired = Mode.valueOf(intent?.getStringExtra(EXTRA_MODE) ?: chooseMode().name)
         applyMode(desired)
         ensureAdbStateWatcher()
@@ -195,6 +202,48 @@ class FlowhookService : Service() {
             nm.notify(id, builder.build())
         } catch (t: Throwable) {
             Log.w(TAG, "alert notification failed: ${t.message}")
+        }
+    }
+
+    private fun showUpdateApprovalNotification(requestId: String, title: String, text: String) {
+        try {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val id = APPROVAL_ID_BASE + (requestId.hashCode() and 0x3FF)
+            val intent = Intent(this, FlowhookService::class.java)
+                .setAction(ACTION_APPROVE_UPDATE)
+                .putExtra(EXTRA_UPDATE_REQUEST_ID, requestId)
+            val pi = PendingIntent.getService(
+                this,
+                id,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val builder = Notification.Builder(this, CH_ALERTS)
+                .setContentTitle(title.ifBlank { "Flowhook update ready" })
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setSmallIcon(android.R.drawable.stat_notify_sync)
+                .setAutoCancel(true)
+                .addAction(android.R.drawable.stat_sys_download_done, "Approve", pi)
+            nm.notify(id, builder.build())
+        } catch (t: Throwable) {
+            Log.w(TAG, "update approval notification failed: ${t.message}")
+        }
+    }
+
+    private fun sendUpdateApproval(requestId: String) {
+        if (requestId.isBlank()) return
+        scope.launch {
+            val payload = JSONObject()
+                .put("type", "update_approved")
+                .put("request_id", requestId)
+                .put("approved", true)
+            val sent = synchronized(wsLock) { ws }?.send(payload.toString()) == true
+            showUserNotification(
+                "Flowhook update",
+                if (sent) "Update approved. Flimflam will install it now." else "Approval could not be sent. Flowhook is reconnecting."
+            )
+            if (!sent && currentMode == Mode.FULL) ensureWebSocket()
         }
     }
 
@@ -413,6 +462,14 @@ class FlowhookService : Service() {
                         )
                         return@launch
                     }
+                    if (msg.optString("type") == "update_prompt") {
+                        showUpdateApprovalNotification(
+                            msg.optString("request_id", ""),
+                            msg.optString("title", "Flowhook update ready"),
+                            msg.optString("text", "Tap Approve to install the update.")
+                        )
+                        return@launch
+                    }
                     val reply = CommandHandler.handle(msg)
                     webSocket.send(reply.toString())
                 }
@@ -556,7 +613,10 @@ class FlowhookService : Service() {
         const val CH_IDLE = "flowhook_idle"
         const val CH_ALERTS = "flowhook_alerts"
         const val ALERT_ID_BASE = 100
+        const val APPROVAL_ID_BASE = 400
+        const val ACTION_APPROVE_UPDATE = "com.dustforge.flowhook.APPROVE_UPDATE"
         const val EXTRA_MODE = "mode"
+        const val EXTRA_UPDATE_REQUEST_ID = "update_request_id"
 
         // v0.3.2: app-level heartbeat. 20s ping cadence with 30s deadline
         // means a dead socket is detected and replaced within ~50s worst
