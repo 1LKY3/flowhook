@@ -67,12 +67,12 @@ class MainActivity : AppCompatActivity() {
         toggleAdb.setOnClickListener {
             val newState = toggleAdb.isChecked  // Switch already flipped visually
             if (newState) {
-                // Turning on (from UI) — but note this doesn't actually enable tcpip.
-                // It just tells Flowhook to try using it. Show a note.
+                // Turning on also runs the same recovery path exposed to the
+                // server, so a locally disabled bridge can come back without
+                // USB when persist.adb.tcp.port is still viable.
                 Config.setAdbBridgeEnabled(this, true)
-                toast("ADB Bridge will re-try connection. If tcpip is off, connect via USB and run `adb tcpip 5555`.")
                 syncService()
-                refreshStatus()
+                recoverAdbBridge()
             } else {
                 // Turning off — show confirmation. Revert toggle until confirmed.
                 toggleAdb.isChecked = true
@@ -96,6 +96,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        findViewById<Button>(R.id.btn_recover_adb).setOnClickListener { showRecoverAdbDialog() }
 
         findViewById<Button>(R.id.btn_battery_opt).setOnClickListener { openBatteryOptimization() }
         findViewById<Button>(R.id.btn_samsung).setOnClickListener { openSamsungNeverSleeping() }
@@ -172,16 +173,39 @@ class MainActivity : AppCompatActivity() {
                 // Issue the kill command via the current ADB bridge. This will itself
                 // disconnect us, which is expected.
                 val killCmd = "setprop service.adb.tcp.port -1; stop adbd; start adbd"
-                val r = AdbExecutor.exec(killCmd, timeoutMs = 5_000)
+                AdbExecutor.exec(killCmd, timeoutMs = 5_000)
                 AdbExecutor.disconnect()
                 withContext(Dispatchers.Main) {
-                    toast("ADB Bridge off. Re-enable via USB + `adb tcpip 5555`.")
+                    toast("ADB Bridge off. Use Recover or turn it back on to restore.")
                     syncService()
                     refreshStatus()
                 }
             }
         }
         dialog.show()
+    }
+
+    private fun showRecoverAdbDialog() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Recover ADB Bridge?")
+            .setMessage("This is manual recovery only. It may briefly interrupt USB or Android Auto by restarting adbd.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Recover") { _, _ -> recoverAdbBridge() }
+            .show()
+    }
+
+    private fun recoverAdbBridge() {
+        toast("Recovering ADB Bridge...")
+        Config.setAdbBridgeEnabled(this, true)
+        toggleAdb.isChecked = true
+        syncService()
+        CoroutineScope(Dispatchers.IO).launch {
+            val r = SettingsGuard.recoverAdbBridge(applicationContext)
+            withContext(Dispatchers.Main) {
+                toast(if (r.ok) "ADB Bridge recovered" else "ADB recovery failed")
+                refreshStatus()
+            }
+        }
     }
 
     private fun refreshStatus() {

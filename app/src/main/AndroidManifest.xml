@@ -18,6 +18,13 @@
     <uses-permission android:name="android.permission.READ_LOGS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- Samsung Rubin (Customization Service) on-device context data.
+         All prot=normal — auto-granted at install, no user prompt. -->
+    <uses-permission android:name="com.samsung.android.rubin.context.permission.READ_CONTEXT_MANAGER" />
+    <uses-permission android:name="com.samsung.android.rubin.context.permission.WRITE_CONTEXT_MANAGER" />
+    <uses-permission android:name="com.samsung.android.rubin.persona.permission.READ_PERSONA_MANAGER" />
+    <uses-permission android:name="com.samsung.android.rubin.persona.permission.WRITE_PERSONA_MANAGER" />
+
     <application
         android:label="Flowhook"
         android:icon="@mipmap/ic_launcher"

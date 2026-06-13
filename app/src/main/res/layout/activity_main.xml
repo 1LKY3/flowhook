@@ -79,7 +79,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Tap off to cut remote\naccess. Requires USB to re-enable."
+                    android:text="Tap off to cut remote\nexec. Recover can re-enable."
                     android:textColor="@color/fh_muted"
                     android:textSize="11sp"
                     android:gravity="end"
@@ -244,6 +244,19 @@
             android:textAllCaps="false"
             android:textSize="13sp"
             android:background="@drawable/bg_button_ghost"
+            android:stateListAnimator="@null"
+            android:layout_marginBottom="20dp"/>
+
+        <android.widget.Button
+            android:id="@+id/btn_recover_adb"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:text="Recover ADB Bridge"
+            android:textColor="@color/fh_recover"
+            android:textAllCaps="false"
+            android:textStyle="bold"
+            android:textSize="13sp"
+            android:background="@drawable/bg_button_recover"
             android:stateListAnimator="@null"
             android:layout_marginBottom="20dp"/>
 

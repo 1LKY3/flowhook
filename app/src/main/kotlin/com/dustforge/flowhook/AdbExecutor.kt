@@ -65,6 +65,58 @@ object AdbExecutor {
         }
     }
 
+    @Synchronized
+    fun discover(ctx: Context): Result {
+        dadbRef.get()?.let {
+            try { (it as? Closeable)?.close() } catch (_: Throwable) {}
+        }
+        return try {
+            val keyPair = AdbKeyStore.keyPair(ctx)
+            val d = Dadb.discover("127.0.0.1", keyPair, 150, 150)
+                ?: return Result("", "discover failed: no localhost ADB service found", -1)
+            val probe = d.shell("echo flowhook_ok")
+            if (probe.exitCode == 0 && probe.output.contains("flowhook_ok")) {
+                dadbRef.set(d)
+                _ready.value = true
+                Log.i(TAG, "adb bridge discovered on localhost")
+                Result(probe.output, probe.errorOutput, probe.exitCode)
+            } else {
+                (d as? Closeable)?.close()
+                _ready.value = false
+                Result(probe.output, "discover probe failed: exit=${probe.exitCode}\n${probe.errorOutput}", probe.exitCode)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "discover failed: ${e.message}")
+            dadbRef.set(null)
+            _ready.value = false
+            Result("", "discover failed: ${e.message}", -1)
+        }
+    }
+
+    @Synchronized
+    fun ensureTcpipMode(ctx: Context, port: Int = DEFAULT_PORT): Result {
+        val current = exec("getprop service.adb.tcp.port")
+        if (current.exit == 0 && current.stdout.trim() == port.toString()) {
+            return Result("ADB TCP already on $port", current.stderr, 0)
+        }
+        val d = dadbRef.get()
+            ?: return Result("", "adb bridge not connected", -2)
+        return try {
+            d.open("tcpip:$port").close()
+            disconnect()
+            Thread.sleep(1_500)
+            val r = connect(ctx, port)
+            if (r.exit == 0) {
+                Result("ADB TCP enabled on $port\n${r.stdout}", r.stderr, 0)
+            } else {
+                Result(r.stdout, "tcpip:$port requested, reconnect failed\n${r.stderr}", r.exit)
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "tcpip:$port failed: ${e.message}")
+            Result("", "tcpip:$port failed: ${e.message}", -1)
+        }
+    }
+
     fun exec(cmd: String, timeoutMs: Long = 30_000): Result {
         val d = dadbRef.get()
             ?: return Result("", "adb bridge not connected", -2)

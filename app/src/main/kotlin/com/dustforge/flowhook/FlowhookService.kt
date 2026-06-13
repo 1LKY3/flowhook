@@ -3,9 +3,11 @@ package com.dustforge.flowhook
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -23,7 +25,7 @@ import java.util.concurrent.TimeUnit
  * Service modes:
  *  - FULL:  WebSocket to flowhook.dustforge.com + WakeLock + ADB supervisor. Default-importance notification.
  *           Used when left toggle (services) is ON.
- *  - IDLE:  ADB supervisor only, no WS, no WakeLock. Minimum-importance notification (collapsed, silent).
+ *  - IDLE:  ADB connector only, no WS, no WakeLock. Minimum-importance notification (collapsed, silent).
  *           Used when left toggle is OFF but right toggle (ADB bridge) is ON.
  *  - STOP:  Service exits. Used when both toggles are off.
  *
@@ -35,6 +37,10 @@ class FlowhookService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var ws: WebSocket? = null
+    private val wsLock = Any()
+    private var wsConnecting = false
+    private var wsGeneration = 0L
+    private var reconnectJob: Job? = null
     private val okClient = OkHttpClient.Builder()
         .pingInterval(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -66,9 +72,9 @@ class FlowhookService : Service() {
         // hello+pong round-trip lands.
         _wsConnected.value = false
         lastPongAt = 0L
-        // v0.3.4: re-assert adb_enabled / adb_wifi_enabled on every service
-        // start. No-op if Samsung hasn't touched them; self-heal if it has.
-        SettingsGuard.reassert(applicationContext)
+        // v0.3.9: do not write adb_enabled/adb_wifi_enabled from normal
+        // service startup. Restarting adbd can re-enumerate USB and break
+        // Android Auto while the phone is connected to a car.
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -94,7 +100,7 @@ class FlowhookService : Service() {
         val right = Config.getAdbBridgeEnabled(this)
         return when {
             left  -> Mode.FULL
-            right -> Mode.IDLE  // keep ADB supervisor warm
+            right -> Mode.IDLE  // keep ADB connector warm
             else  -> Mode.STOP
         }
     }
@@ -172,14 +178,21 @@ class FlowhookService : Service() {
         try {
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             val id = ALERT_ID_BASE + (alertCounter++ and 0xFF)
-            val n = Notification.Builder(this, CH_ALERTS)
+            val builder = Notification.Builder(this, CH_ALERTS)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setStyle(Notification.BigTextStyle().bigText(text))
                 .setSmallIcon(android.R.drawable.stat_sys_warning)
                 .setAutoCancel(true)
-                .build()
-            nm.notify(id, n)
+            // If the text looks like a URL, make the notification tap open it
+            val url = text.trim().let { if (it.startsWith("http://") || it.startsWith("https://")) it else null }
+            if (url != null) {
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(url))
+                val pi = PendingIntent.getActivity(this, id, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                builder.setContentIntent(pi)
+            }
+            nm.notify(id, builder.build())
         } catch (t: Throwable) {
             Log.w(TAG, "alert notification failed: ${t.message}")
         }
@@ -266,28 +279,50 @@ class FlowhookService : Service() {
         if (adbSupervisorJob?.isActive == true) return
         adbSupervisorJob = scope.launch {
             var tick = 0
+            var consecutiveFailures = 0
             while (isActive) {
                 if (Config.getAdbBridgeEnabled(this@FlowhookService) && !AdbExecutor.isReady()) {
                     val r = AdbExecutor.connect(applicationContext)
                     if (r.exit == 0) {
                         Log.i(TAG, "adb bridge connected: ${r.stdout.trim()}")
-                        AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.WRITE_SECURE_SETTINGS")
+                        SettingsGuard.ensureTcpip(this@FlowhookService)
+                        consecutiveFailures = 0
                         AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
-                        // v0.3.4: once we have shell, plant the persistence
-                        // props so adbd keeps listening on 5555 after reboots.
-                        // Idempotent — if already set, setprop is a no-op.
-                        AdbExecutor.exec("setprop persist.adb.tcp.port 5555")
-                        AdbExecutor.exec("settings put global adb_enabled 1")
                         updateNotification()
+                    } else {
+                        consecutiveFailures++
+                        if (consecutiveFailures == 3) {
+                            Log.w(TAG, "adb bridge unavailable for 3 ticks; forcing adbd restart via cycleAdb")
+                            val cycled = SettingsGuard.cycleAdb(this@FlowhookService)
+                            if (cycled) {
+                                delay(3_000)
+                                val retry = AdbExecutor.connect(applicationContext)
+                                if (retry.exit == 0) {
+                                    Log.i(TAG, "adb bridge recovered after cycleAdb: ${retry.stdout.trim()}")
+                                    SettingsGuard.ensureTcpip(this@FlowhookService)
+                                    consecutiveFailures = 0
+                                    AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
+                                    updateNotification()
+                                }
+                            }
+                        } else if (consecutiveFailures % 30 == 0) {
+                            Log.w(TAG, "adb bridge still unavailable after $consecutiveFailures ticks; retrying cycleAdb")
+                            SettingsGuard.cycleAdb(this@FlowhookService)
+                            delay(3_000)
+                            val retry = AdbExecutor.connect(applicationContext)
+                            if (retry.exit == 0) {
+                                Log.i(TAG, "adb bridge recovered on retry $consecutiveFailures: ${retry.stdout.trim()}")
+                                SettingsGuard.ensureTcpip(this@FlowhookService)
+                                consecutiveFailures = 0
+                                AdbExecutor.exec("pm grant com.dustforge.flowhook android.permission.READ_LOGS")
+                                updateNotification()
+                            }
+                        }
                     }
+                } else if (AdbExecutor.isReady()) {
+                    consecutiveFailures = 0
                 }
-                // v0.3.4: every ~5 min (10s * 30 ticks) re-run the app-process
-                // Settings guard. This catches Samsung silently flipping
-                // adb_enabled off between service starts.
                 tick++
-                if (tick % 30 == 0) {
-                    SettingsGuard.reassert(applicationContext)
-                }
                 delay(10_000)
             }
         }
@@ -302,14 +337,21 @@ class FlowhookService : Service() {
     // --- WebSocket -----------------------------------------------------
 
     private fun ensureWebSocket() {
-        if (ws != null) return
         connectWs()
     }
 
     private fun closeWebSocket() {
+        val sock = synchronized(wsLock) {
+            wsGeneration++
+            wsConnecting = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            val current = ws
+            ws = null
+            current
+        }
         stopHeartbeat()
-        ws?.close(1000, "mode change")
-        ws = null
+        sock?.close(1000, "mode change")
         _wsConnected.value = false
     }
 
@@ -320,26 +362,44 @@ class FlowhookService : Service() {
             return
         }
         val url = Config.getServerUrl(this)
+        val generation = synchronized(wsLock) {
+            if (ws != null || wsConnecting) return
+            reconnectJob?.cancel()
+            reconnectJob = null
+            wsConnecting = true
+            ++wsGeneration
+        }
         Log.i(TAG, "ws connecting to $url")
         val req = Request.Builder().url(url).build()
-        ws = okClient.newWebSocket(req, object : WebSocketListener() {
+        val newSocket = okClient.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (!isCurrentOrConnectingSocket(webSocket, generation)) {
+                    Log.i(TAG, "ignoring stale ws open generation=$generation")
+                    webSocket.cancel()
+                    return
+                }
                 Log.i(TAG, "ws open")
                 reconnectDelay = 1000L
                 webSocket.send(JSONObject().put("token", token).toString())
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 scope.launch {
+                    if (!isCurrentOrConnectingSocket(webSocket, generation)) return@launch
                     val msg = runCatching { JSONObject(text) }.getOrNull() ?: return@launch
                     if (msg.optString("type") == "hello") {
+                        val renewedToken = msg.optString("renewed_token", "")
+                        if (renewedToken.isNotEmpty()) {
+                            Config.setToken(applicationContext, renewedToken)
+                            Log.i(TAG, "token auto-renewed by server")
+                        }
                         Log.i(TAG, "handshake ok device=${msg.optString("device_id")}")
-                        // v0.3.2: connection is authenticated — flip the
-                        // authoritative state and start the watchdog.
-                        onAuthenticated()
+                        onAuthenticated(webSocket, generation)
                         return@launch
                     }
                     if (msg.optString("type") == "pong") {
-                        lastPongAt = System.currentTimeMillis()
+                        if (isCurrentSocket(webSocket, generation)) {
+                            lastPongAt = System.currentTimeMillis()
+                        }
                         return@launch
                     }
                     // v0.3.5: server-pushed notification. Fire-and-forget —
@@ -360,38 +420,80 @@ class FlowhookService : Service() {
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {}
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.w(TAG, "ws failure: ${t.message}")
-                onDisconnected()
-                if (currentMode == Mode.FULL) scheduleReconnect()
+                handleSocketDisconnected(webSocket, generation)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.i(TAG, "ws closed: $code $reason")
-                onDisconnected()
-                if (currentMode == Mode.FULL) scheduleReconnect()
+                handleSocketDisconnected(webSocket, generation)
             }
         })
+        synchronized(wsLock) {
+            if (generation == wsGeneration && (ws == null || ws === newSocket)) {
+                ws = newSocket
+                wsConnecting = false
+            } else {
+                newSocket.cancel()
+            }
+        }
     }
 
-    private fun onAuthenticated() {
+    private fun isCurrentSocket(webSocket: WebSocket, generation: Long): Boolean =
+        synchronized(wsLock) { generation == wsGeneration && ws === webSocket }
+
+    private fun isCurrentOrConnectingSocket(webSocket: WebSocket, generation: Long): Boolean =
+        synchronized(wsLock) {
+            generation == wsGeneration && (ws === webSocket || (ws == null && wsConnecting))
+        }
+
+    private fun onAuthenticated(webSocket: WebSocket, generation: Long) {
+        val authenticated = synchronized(wsLock) {
+            if (generation == wsGeneration && (ws === webSocket || (ws == null && wsConnecting))) {
+                ws = webSocket
+                wsConnecting = false
+                true
+            } else {
+                false
+            }
+        }
+        if (!authenticated) {
+            Log.i(TAG, "ignoring stale ws auth generation=$generation")
+            return
+        }
         Log.i(TAG, "DIAG onAuthenticated: flipping _wsConnected -> true (was ${_wsConnected.value})")
         _wsConnected.value = true
         lastPongAt = System.currentTimeMillis()
-        startHeartbeat()
+        startHeartbeat(webSocket, generation)
         updateNotification()
     }
 
-    private fun onDisconnected() {
+    private fun handleSocketDisconnected(webSocket: WebSocket, generation: Long) {
+        val shouldHandle = synchronized(wsLock) {
+            if (generation != wsGeneration || (ws !== webSocket && !(ws == null && wsConnecting))) {
+                false
+            } else {
+                ws = null
+                wsConnecting = false
+                wsGeneration++
+                true
+            }
+        }
+        if (!shouldHandle) {
+            Log.i(TAG, "ignoring stale ws disconnect generation=$generation")
+            return
+        }
         Log.i(TAG, "DIAG onDisconnected: flipping _wsConnected -> false (was ${_wsConnected.value})")
         _wsConnected.value = false
         stopHeartbeat()
         updateNotification()
+        if (currentMode == Mode.FULL) scheduleReconnect()
     }
 
-    private fun startHeartbeat() {
+    private fun startHeartbeat(webSocket: WebSocket, generation: Long) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(HEARTBEAT_INTERVAL_MS)
-                val sock = ws
+                if (!isCurrentSocket(webSocket, generation)) break
                 val age = System.currentTimeMillis() - lastPongAt
                 // v0.3.6: the app is its own source of truth for connection
                 // health. Do not wait for onFailure / onClosed to fire —
@@ -401,25 +503,23 @@ class FlowhookService : Service() {
                 // _wsConnected on every tick from local data (pong age +
                 // socket presence). UI status reflects reality at each
                 // tick regardless of what OkHttp does or doesn't deliver.
-                val healthy = sock != null && age < HEARTBEAT_DEADLINE_MS
+                val healthy = age < HEARTBEAT_DEADLINE_MS
                 if (_wsConnected.value != healthy) {
-                    Log.i(TAG, "tick: _wsConnected ${_wsConnected.value} -> $healthy (age=${age}ms, sock=${sock != null})")
+                    Log.i(TAG, "tick: _wsConnected ${_wsConnected.value} -> $healthy (age=${age}ms, sock=true)")
                     _wsConnected.value = healthy
                     updateNotification()
                 }
                 if (!healthy) {
                     Log.w(TAG, "heartbeat declared unhealthy — cancelling socket + scheduling reconnect")
-                    sock?.cancel()
-                    if (currentMode == Mode.FULL) scheduleReconnect()
+                    webSocket.cancel()
+                    handleSocketDisconnected(webSocket, generation)
                     break
                 }
-                val ok = sock!!.send(JSONObject().put("type", "ping").toString())
+                val ok = webSocket.send(JSONObject().put("type", "ping").toString())
                 if (!ok) {
                     Log.w(TAG, "heartbeat send returned false — socket queue saturated, forcing reconnect")
-                    _wsConnected.value = false
-                    updateNotification()
-                    sock.cancel()
-                    if (currentMode == Mode.FULL) scheduleReconnect()
+                    webSocket.cancel()
+                    handleSocketDisconnected(webSocket, generation)
                     break
                 }
             }
@@ -432,10 +532,20 @@ class FlowhookService : Service() {
     }
 
     private fun scheduleReconnect() {
-        scope.launch {
-            delay(reconnectDelay)
-            reconnectDelay = (reconnectDelay * 2).coerceAtMost(10_000)
-            if (currentMode == Mode.FULL) connectWs()
+        synchronized(wsLock) {
+            if (reconnectJob?.isActive == true || ws != null || wsConnecting) return
+            reconnectJob = scope.launch {
+                val delayMs = synchronized(wsLock) {
+                    val current = reconnectDelay
+                    reconnectDelay = (reconnectDelay * 2).coerceAtMost(10_000)
+                    current
+                }
+                delay(delayMs)
+                synchronized(wsLock) {
+                    reconnectJob = null
+                }
+                if (currentMode == Mode.FULL) ensureWebSocket()
+            }
         }
     }
 

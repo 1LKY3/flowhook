@@ -18,7 +18,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="If you turn this off, you won't be able to turn it back on until you connect your phone to a computer and run &#160;&#160;adb tcpip 5555."
+        android:text="This cuts normal remote command execution by stopping the local ADB connector. Use Recover ADB Bridge or turn this switch back on to restore it; USB is only needed if Android has cleared every local ADB listener."
         android:textColor="@color/fh_fg"
         android:textSize="14sp"
         android:lineSpacingExtra="3dp"
